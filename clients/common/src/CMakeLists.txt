@@ -26,5 +26,6 @@ if(HIPBLASLT_ENABLE_BLIS)
 endif()
 
 if(rocm_smi_FOUND)
+    target_compile_definitions(hipblaslt-clients-common PRIVATE HIPBLASLT_HAS_ROCM_SMI)
     target_link_libraries(hipblaslt-clients-common PRIVATE rocm_smi64)
 endif()

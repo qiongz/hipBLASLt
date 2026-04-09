@@ -209,7 +209,15 @@ typedef enum {
 typedef enum {
   HIPBLASLT_MATMUL_PREF_SEARCH_MODE = 0,          /**<Search mode. Data Type: uint32_t*/
   HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1,  /**<Maximum allowed workspace memory. Default is 0 (no workspace memory allowed). Data Type: uint64_t*/
-  HIPBLASLT_MATMUL_PREF_MAX = 2
+
+  HIPBLASLT_MATMUL_PREF_OVERLAP_MODE_EXT = 100,         /**<Overlap hint mode. Data Type: uint32_t*/
+  HIPBLASLT_MATMUL_PREF_EFFECTIVE_CU_COUNT_EXT = 101,   /**<Effective CU count upper bound. Data Type: uint32_t*/
+  HIPBLASLT_MATMUL_PREF_EFFECTIVE_CU_BUCKET_EXT = 102,  /**<Effective CU bucket id. Data Type: uint32_t*/
+  HIPBLASLT_MATMUL_PREF_COMM_PRESSURE_LEVEL_EXT = 103,  /**<Communication pressure level. Data Type: uint32_t*/
+  HIPBLASLT_MATMUL_PREF_TOPOLOGY_SCOPE_EXT = 104,       /**<Topology scope hint. Data Type: uint32_t*/
+  HIPBLASLT_MATMUL_PREF_POLICY_HINT_VERSION_EXT = 105,  /**<External policy hint ABI version. Data Type: uint32_t*/
+
+  HIPBLASLT_MATMUL_PREF_MAX = 106
 } hipblasLtMatmulPreferenceAttributes_t;
 
 /*! \ingroup types_module

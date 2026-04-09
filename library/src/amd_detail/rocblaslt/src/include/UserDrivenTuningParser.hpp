@@ -67,6 +67,35 @@ private:
     ~OverrideSingleton() {}
 };
 
+class ScopedOverrideSingleton
+{
+public:
+    std::string file_path;
+    bool        env_mode = false;
+
+    static ScopedOverrideSingleton& getInstance()
+    {
+        static ScopedOverrideSingleton gInstance;
+        return gInstance;
+    }
+
+    ScopedOverrideSingleton(const ScopedOverrideSingleton&) = delete;
+    ScopedOverrideSingleton& operator=(const ScopedOverrideSingleton&) = delete;
+
+private:
+    ScopedOverrideSingleton()
+    {
+        char* Env = getenv("HIPBLASLT_UOPC_SCOPED_TUNING_FILE");
+        if(Env)
+        {
+            file_path = Env;
+            env_mode  = true;
+        }
+    }
+
+    ~ScopedOverrideSingleton() {}
+};
+
 namespace TensileLite
 {
 
@@ -82,7 +111,13 @@ namespace TensileLite
         b_type,
         c_type,
         compute_type,
+        activation_type,
+        bias_vector,
+        bias_type,
+        aux_type,
         solution_index,
+        gcn_arch_name,
+        cu_count,
         count
     };
 
@@ -99,7 +134,13 @@ namespace TensileLite
                         size_t           m,
                         size_t           n,
                         size_t           k,
-                        size_t           batchSize);
+                        size_t           batchSize,
+                        std::string      arch    = "",
+                        size_t           cuCount = 0,
+                        int              biasVector = 0,
+                        rocisa::DataType biasType   = rocisa::DataType::None,
+                        rocisa::DataType auxType    = rocisa::DataType::None,
+                        std::string      activationType = "none");
         ProblemOverride(const ProblemOverride& problem);
 
         inline bool transA() const
@@ -142,6 +183,30 @@ namespace TensileLite
         {
             return m_batchSize;
         }
+        inline const std::string& arch() const
+        {
+            return m_arch;
+        }
+        inline size_t cuCount() const
+        {
+            return m_cuCount;
+        }
+        inline int biasVector() const
+        {
+            return m_biasVector;
+        }
+        inline rocisa::DataType biasType() const
+        {
+            return m_biasType;
+        }
+        inline rocisa::DataType auxType() const
+        {
+            return m_auxType;
+        }
+        inline const std::string& activationType() const
+        {
+            return m_activationType;
+        }
 
     private:
         bool             m_transA;
@@ -154,6 +219,12 @@ namespace TensileLite
         size_t           m_n;
         size_t           m_k;
         size_t           m_batchSize;
+        std::string      m_arch;
+        size_t           m_cuCount;
+        int              m_biasVector;
+        rocisa::DataType m_biasType;
+        rocisa::DataType m_auxType;
+        std::string      m_activationType;
     };
 
     std::pair<ProblemOverride, int> problemFromEntries(const std::vector<std::string>& entries);
@@ -170,7 +241,11 @@ namespace TensileLite
 
         static int compare(ProblemOverride const& lhs, ProblemOverride const& rhs)
         {
-            return LexicographicCompare(lhs.transA(),
+            return LexicographicCompare(lhs.arch(),
+                                        rhs.arch(),
+                                        lhs.cuCount(),
+                                        rhs.cuCount(),
+                                        lhs.transA(),
                                         rhs.transA(),
                                         lhs.transB(),
                                         rhs.transB(),
@@ -189,7 +264,15 @@ namespace TensileLite
                                         lhs.k(),
                                         rhs.k(),
                                         lhs.batchSize(),
-                                        rhs.batchSize());
+                                        rhs.batchSize(),
+                                        lhs.activationType(),
+                                        rhs.activationType(),
+                                        lhs.biasVector(),
+                                        rhs.biasVector(),
+                                        lhs.biasType(),
+                                        rhs.biasType(),
+                                        lhs.auxType(),
+                                        rhs.auxType());
         }
     };
 
@@ -223,6 +306,18 @@ namespace TensileLite
             return iter;
         }
 
+        std::vector<int> lookup(const ProblemOverride& prob_key)
+        {
+            std::shared_lock<std::shared_timed_mutex> lock(m_mutex);
+            auto                                      range = m_override.equal_range(prob_key);
+            std::vector<int>                          solutions;
+            for(auto it = range.first; it != range.second; ++it)
+            {
+                solutions.push_back(it->second);
+            }
+            return solutions;
+        }
+
         void add(const std::pair<ProblemOverride, int>& problemSolution)
         {
             std::lock_guard<std::shared_timed_mutex> lock(m_mutex);
@@ -254,7 +349,9 @@ namespace std
     {
         inline size_t operator()(TensileLite::ProblemOverride const& po) const
         {
-            return TensileLite::hash_combine(po.transA(),
+            return TensileLite::hash_combine(po.arch(),
+                                             po.cuCount(),
+                                             po.transA(),
                                              po.transB(),
                                              po.inputTypeA(),
                                              po.inputTypeB(),

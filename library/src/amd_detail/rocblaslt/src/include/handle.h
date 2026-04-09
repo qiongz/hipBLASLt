@@ -235,6 +235,13 @@ struct _rocblaslt_matmul_preference
     uint32_t search_mode         = 0;
     uint64_t max_workspace_bytes = 0;
 
+    uint32_t overlap_mode        = 0;
+    uint32_t effective_cu_count  = 0;
+    uint32_t effective_cu_bucket = 0;
+    uint32_t comm_pressure_level = 0;
+    uint32_t topology_scope      = 0;
+    uint32_t policy_hint_version = 0;
+
     int64_t alg_config_id     = 0;
     int64_t alg_max_id        = 0;
     int64_t search_iterations = 0;

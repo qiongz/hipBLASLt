@@ -284,8 +284,14 @@ namespace TensileLite
 }
 
 TensileLite::ProblemOverride
-    RocblasltContractionProblem2ProblemOverride(const RocblasltContractionProblem&);
+    RocblasltContractionProblem2ProblemOverride(const RocblasltContractionProblem&,
+                                               const std::string& arch = "",
+                                               uint32_t           cuCount = 0);
 
-TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<void>);
+TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<void>,
+                                                             const std::string& arch = "",
+                                                             uint32_t           cuCount = 0);
+
+uint32_t TensileDataGemmEffectiveCuCount(std::shared_ptr<void>);
 
 TensileLite::ContractionProblemGemm* ExtractProblemGemm(std::shared_ptr<void>);

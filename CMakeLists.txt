@@ -88,6 +88,7 @@ if(HIPBLASLT_ENABLE_HOST)
     option(HIPBLASLT_ENABLE_ROCROLLER "Use RocRoller library." ON)
     cmake_dependent_option(HIPBLASLT_ENABLE_MARKER "Use the marker library." ON "NOT WIN32" OFF)
     option(HIPBLASLT_ENABLE_HIPBLAS_DIRECT "Use the hipblas header directly." OFF)
+    option(HIPBLASLT_ENABLE_UOPC "Enable UOPC runtime hint integration." OFF)
 endif()
 
 set(CMAKE_SKIP_BUILD_RPATH FALSE CACHE BOOL "Skip build RPATH")
@@ -123,6 +124,9 @@ if(HIPBLASLT_ENABLE_HOST)
         find_library(rocTracer roctx64 REQUIRED)
     else()
         set(rocTracer)
+    endif()
+    if(HIPBLASLT_ENABLE_UOPC)
+        find_package(uopc REQUIRED CONFIG)
     endif()
 endif()
 
@@ -184,20 +188,77 @@ else()
     set(HIPBLASLT_PYTHON_COMMAND "${Python_EXECUTABLE}")
 endif()
 
+set(HIPBLASLT_ROCROLLER_SOURCE_DIR "" CACHE PATH "Override source directory for external rocroller dependency.")
+set(HIPBLASLT_ORIGAMI_SOURCE_DIR "" CACHE PATH "Override source directory for external origami dependency.")
+
+function(hipblaslt_resolve_external_source out_var user_override dependency_name)
+    if(user_override)
+        if(EXISTS "${user_override}/CMakeLists.txt")
+            set(${out_var} "${user_override}" PARENT_SCOPE)
+            return()
+        endif()
+        message(FATAL_ERROR
+            "Configured ${dependency_name} source dir does not contain CMakeLists.txt: ${user_override}")
+    endif()
+
+    set(candidates ${ARGN})
+    foreach(candidate IN LISTS candidates)
+        if(EXISTS "${candidate}/CMakeLists.txt")
+            set(${out_var} "${candidate}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    list(JOIN candidates "\n  - " candidates_text)
+    message(FATAL_ERROR
+        "Could not locate external dependency '${dependency_name}'. Tried:\n  - ${candidates_text}\n"
+        "Set -D${dependency_name}=<path> or the matching HIPBLASLT_*_SOURCE_DIR cache variable.")
+endfunction()
+
+set(HIPBLASLT_RESOLVED_ROCROLLER_SOURCE_DIR "")
+if(HIPBLASLT_ENABLE_ROCROLLER AND NOT ROCM_LIBS_SUPERBUILD AND NOT HIPBLASLT_ENABLE_THEROCK)
+    hipblaslt_resolve_external_source(HIPBLASLT_RESOLVED_ROCROLLER_SOURCE_DIR
+                                      "${HIPBLASLT_ROCROLLER_SOURCE_DIR}"
+                                      "HIPBLASLT_ROCROLLER_SOURCE_DIR"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/rocroller"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/rocRoller"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/../shared/rocroller"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/../shared/rocRoller"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/../rocm-libraries/shared/rocroller")
+endif()
+hipblaslt_resolve_external_source(HIPBLASLT_RESOLVED_ORIGAMI_SOURCE_DIR
+                                  "${HIPBLASLT_ORIGAMI_SOURCE_DIR}"
+                                  "HIPBLASLT_ORIGAMI_SOURCE_DIR"
+                                  "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/origami"
+                                  "${CMAKE_CURRENT_SOURCE_DIR}/../shared/origami"
+                                  "${CMAKE_CURRENT_SOURCE_DIR}/../rocm-libraries/shared/origami")
+
+if(HIPBLASLT_RESOLVED_ROCROLLER_SOURCE_DIR)
+    message(STATUS "Using external rocroller source: ${HIPBLASLT_RESOLVED_ROCROLLER_SOURCE_DIR}")
+endif()
+message(STATUS "Using external origami source: ${HIPBLASLT_RESOLVED_ORIGAMI_SOURCE_DIR}")
+
 if(HIPBLASLT_ENABLE_ROCROLLER)
     if(NOT ROCM_LIBS_SUPERBUILD)
         if(HIPBLASLT_ENABLE_THEROCK)
+            find_package(yaml-cpp QUIET CONFIG)
+            if(TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
+                add_library(yaml-cpp::yaml-cpp INTERFACE IMPORTED GLOBAL)
+                target_link_libraries(yaml-cpp::yaml-cpp INTERFACE yaml-cpp)
+            endif()
             find_package(rocroller REQUIRED)
         else()
             block(SCOPE_FOR VARIABLES)
                 set(ROCROLLER_ENABLE_FETCH ON)
                 set(ROCROLLER_BUILD_TESTING OFF)
                 set(ROCROLLER_ENABLE_CLIENT OFF)
+                set(CMAKE_DISABLE_FIND_PACKAGE_spdlog ON)
+                set(CMAKE_DISABLE_FIND_PACKAGE_libdivide ON)
                 option(YAML_CPP_INSTALL "" ON)
                 set(BUILD_TESTING OFF)
                 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--exclude-libs,ALL")
                 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
-                add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../shared/rocroller" "${CMAKE_CURRENT_BINARY_DIR}/rocroller")
+                add_subdirectory("${HIPBLASLT_RESOLVED_ROCROLLER_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/rocroller")
             endblock()
         endif()
     endif()
@@ -218,7 +279,16 @@ if(HIPBLASLT_ENABLE_MSGPACK)
     endif()
 endif()
 
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../shared/origami" origami)
+set(_hipblaslt_restore_origami_enable_install FALSE)
+if(NOT DEFINED ORIGAMI_ENABLE_INSTALL)
+    set(ORIGAMI_ENABLE_INSTALL OFF)
+    set(_hipblaslt_restore_origami_enable_install TRUE)
+    message(STATUS "Disabling origami install/package steps for bundled subproject build.")
+endif()
+add_subdirectory("${HIPBLASLT_RESOLVED_ORIGAMI_SOURCE_DIR}" origami)
+if(_hipblaslt_restore_origami_enable_install)
+    unset(ORIGAMI_ENABLE_INSTALL)
+endif()
 add_subdirectory(tensilelite)
 
 if(HIPBLASLT_ENABLE_HOST)
@@ -246,6 +316,11 @@ if(HIPBLASLT_ENABLE_HOST)
             ${CMAKE_DL_LIBS}
             ${rocTracer}
     )
+
+    if(HIPBLASLT_ENABLE_UOPC)
+        target_link_libraries(hipblaslt PRIVATE roc::uopc)
+        target_compile_definitions(hipblaslt PRIVATE HIPBLASLT_ENABLE_UOPC)
+    endif()
 
     if(HIPBLASLT_ENABLE_ASAN)
         hipblaslt_target_configure_sanitizers(hipblaslt PRIVATE)

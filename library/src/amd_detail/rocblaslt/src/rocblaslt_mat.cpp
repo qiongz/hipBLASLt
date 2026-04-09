@@ -29,8 +29,205 @@
 #include "rocblaslt_mat_utils.hpp"
 #include "tensile_host.hpp"
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include <hip/hip_runtime_api.h>
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+#include <uopc/uopc.h>
+#endif
+
+namespace
+{
+#ifdef HIPBLASLT_ENABLE_UOPC
+    inline bool uopcDebugEnabled()
+    {
+        const auto* rawValue = std::getenv("UOPC_DUMP_HINTS");
+        return rawValue != nullptr && rawValue[0] != '\0' && std::strcmp(rawValue, "0") != 0
+               && std::strcmp(rawValue, "false") != 0 && std::strcmp(rawValue, "off") != 0;
+    }
+
+    inline bool uopcEnabled()
+    {
+        static const bool enabled = [] {
+            const auto* rawValue = std::getenv("UOPC_ENABLE");
+            return rawValue == nullptr || rawValue[0] == '\0'
+                   || (std::strcmp(rawValue, "0") != 0 && std::strcmp(rawValue, "false") != 0
+                       && std::strcmp(rawValue, "off") != 0 && std::strcmp(rawValue, "no") != 0);
+        }();
+        return enabled;
+    }
+
+    inline const char* uopcDebugRank()
+    {
+        const auto* rawValue = std::getenv("RANK");
+        return rawValue != nullptr && rawValue[0] != '\0' ? rawValue : "?";
+    }
+
+    inline const char* uopcDebugLocalRank()
+    {
+        const auto* rawValue = std::getenv("LOCAL_RANK");
+        return rawValue != nullptr && rawValue[0] != '\0' ? rawValue : "?";
+    }
+
+    inline bool isBackwardOverlapWindow(uopcOverlapWindowType_t window)
+    {
+        switch(window)
+        {
+        case UOPC_WINDOW_BACKWARD_AR_VS_NEXT_GEMM:
+        case UOPC_WINDOW_BACKWARD_RS_VS_NEXT_GRAD:
+        case UOPC_WINDOW_BACKWARD_PREFETCH_AG_VS_CURRENT_GRAD:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    inline const char* runtimeHintRejectReason(const GemmOverlapHintV1& hint, uint32_t visibleCuCount)
+    {
+        if(hint.source != UOPC_HINT_SOURCE_CONTROLLER)
+            return "non_controller_source";
+        if(hint.relatedSeqNumber == 0)
+            return "missing_related_seq";
+        if(!isBackwardOverlapWindow(hint.overlapWindowType))
+            return "non_backward_window";
+        if(hint.mode == UOPC_HINT_MODE_NONE)
+            return "mode_none";
+        if(hint.effectiveCuUpperBound == 0)
+            return "missing_effective_cu";
+        if(visibleCuCount > 0 && hint.effectiveCuUpperBound >= visibleCuCount)
+            return "not_reduced_cu";
+        return nullptr;
+    }
+
+    inline void dumpRuntimeHintTrace(const RocblasltContractionProblem& problem,
+                                     const GemmHintQueryV1&            query,
+                                     const GemmOverlapHintV1*          hint,
+                                     uopcStatus_t                      status,
+                                     bool                              accepted,
+                                     const char*                       reason,
+                                     uint32_t                          visibleCuCount)
+    {
+        if(!uopcDebugEnabled())
+            return;
+
+        std::fprintf(stderr,
+                     "[hipblaslt][uopc-trace] rank=%s local_rank=%s event=hint path=matmul "
+                     "accepted=%u reason=%s status=%u source=%u mode=%u bucket=%u upper=%u "
+                     "pressure=%u window=%u topo=%u related_seq=%llu stream=%llu grouped=%u "
+                     "m=%llu n=%llu k=%llu visible_cu=%u\n",
+                     uopcDebugRank(),
+                     uopcDebugLocalRank(),
+                     accepted ? 1U : 0U,
+                     reason != nullptr ? reason : "none",
+                     static_cast<unsigned>(status),
+                     hint != nullptr ? static_cast<unsigned>(hint->source) : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->mode) : 0U,
+                     hint != nullptr ? hint->effectiveCuBucket : 0U,
+                     hint != nullptr ? hint->effectiveCuUpperBound : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->commPressureLevel) : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->overlapWindowType) : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->topologyScope) : 0U,
+                     hint != nullptr ? static_cast<unsigned long long>(hint->relatedSeqNumber) : 0ULL,
+                     static_cast<unsigned long long>(query.streamUid),
+                     problem.grouped_gemm ? 1U : 0U,
+                     static_cast<unsigned long long>(problem.m),
+                     static_cast<unsigned long long>(problem.n),
+                     static_cast<unsigned long long>(problem.k),
+                     visibleCuCount);
+    }
+
+    inline void applyRuntimeUopcHint(rocblaslt_handle handle, RocblasltContractionProblem& problem)
+    {
+        if(problem.uopc.valid)
+            return;
+        if(!uopcEnabled())
+            return;
+
+        GemmHintQueryV1   query{};
+        GemmOverlapHintV1 hint{};
+
+        query.version        = UOPC_ABI_VERSION;
+        query.device         = handle->device;
+        query.streamUid      = uopcMakeStreamUid(handle->device, problem.stream);
+        query.computeBackend = UOPC_BACKEND_HIPBLASLT;
+        query.problemClass
+            = problem.grouped_gemm ? UOPC_PROBLEM_GROUPED_GEMM : UOPC_PROBLEM_GEMM;
+        query.m = problem.m;
+        query.n = problem.n;
+        query.k = problem.k;
+        query.semanticFlags = UOPC_GEMM_SEMANTIC_NONE;
+        if(problem.gradient)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_GRADIENT_EPILOGUE;
+        if(problem.grouped_gemm)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_GROUPED;
+        if(problem.trans_a != HIPBLAS_OP_N)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_TRANS_A;
+        if(problem.trans_b != HIPBLAS_OP_N)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_TRANS_B;
+
+        const auto status = uopcQueryGemmHint(&query, &hint);
+        const auto visibleCuCount
+            = handle != nullptr && handle->properties.multiProcessorCount > 0
+                  ? static_cast<uint32_t>(handle->properties.multiProcessorCount)
+                  : 0U;
+        if(status == UOPC_STATUS_SUCCESS && hint.valid)
+        {
+            const auto rejectReason = runtimeHintRejectReason(hint, visibleCuCount);
+            const bool acceptHint   = rejectReason == nullptr;
+            dumpRuntimeHintTrace(problem,
+                                 query,
+                                 &hint,
+                                 status,
+                                 acceptHint,
+                                 acceptHint ? "accepted" : rejectReason,
+                                 visibleCuCount);
+            if(acceptHint)
+            {
+                problem.uopc.valid               = 1;
+                problem.uopc.mode                = hint.mode;
+                problem.uopc.effectiveCuCount    = hint.effectiveCuUpperBound;
+                problem.uopc.effectiveCuBucket   = hint.effectiveCuBucket;
+                problem.uopc.commPressureLevel   = hint.commPressureLevel;
+                problem.uopc.overlapWindowType   = hint.overlapWindowType;
+                problem.uopc.topologyScope       = hint.topologyScope;
+                problem.uopc.source              = hint.source;
+                problem.uopc.relatedSeqNumber    = hint.relatedSeqNumber;
+
+                if(uopcDebugEnabled())
+                {
+                    std::fprintf(stderr,
+                                 "[hipblaslt][uopc] matmul runtime hint source=%u bucket=%u upper=%u "
+                                 "pressure=%u seq=%llu stream=%llu\n",
+                                 static_cast<unsigned>(hint.source),
+                                 hint.effectiveCuBucket,
+                                 hint.effectiveCuUpperBound,
+                                 static_cast<unsigned>(hint.commPressureLevel),
+                                 static_cast<unsigned long long>(hint.relatedSeqNumber),
+                                 static_cast<unsigned long long>(query.streamUid));
+                }
+            }
+        }
+        else
+        {
+            dumpRuntimeHintTrace(problem,
+                                 query,
+                                 nullptr,
+                                 status,
+                                 false,
+                                 status == UOPC_STATUS_UNAVAILABLE ? "no_snapshot"
+                                                                   : "query_failed",
+                                 visibleCuCount);
+        }
+    }
+#else
+    inline void applyRuntimeUopcHint(rocblaslt_handle, RocblasltContractionProblem&)
+    {
+    }
+#endif
+} // namespace
 
 #ifdef __cplusplus
 extern "C" {
@@ -221,6 +418,9 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
                                         handle->Synchronizer,
                                         swizzleA,
                                         swizzleB};
+
+    if(algo == nullptr)
+        applyRuntimeUopcHint(handle, problem);
 
     return runContractionProblem(handle, algo, problem, gemmData);
 }

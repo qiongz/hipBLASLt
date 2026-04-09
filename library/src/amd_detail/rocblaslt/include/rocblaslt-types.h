@@ -387,7 +387,15 @@ typedef enum rocblaslt_matmul_preference_attributes_
 {
     ROCBLASLT_MATMUL_PREF_SEARCH_MODE         = 0,
     ROCBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1,
-    ROCBLASLT_MATMUL_PREF_MAX                 = 2
+
+    ROCBLASLT_MATMUL_PREF_OVERLAP_MODE_EXT         = 100,
+    ROCBLASLT_MATMUL_PREF_EFFECTIVE_CU_COUNT_EXT   = 101,
+    ROCBLASLT_MATMUL_PREF_EFFECTIVE_CU_BUCKET_EXT  = 102,
+    ROCBLASLT_MATMUL_PREF_COMM_PRESSURE_LEVEL_EXT  = 103,
+    ROCBLASLT_MATMUL_PREF_TOPOLOGY_SCOPE_EXT       = 104,
+    ROCBLASLT_MATMUL_PREF_POLICY_HINT_VERSION_EXT  = 105,
+
+    ROCBLASLT_MATMUL_PREF_MAX = 106
 } rocblaslt_matmul_preference_attributes;
 
 /********************************************************************************
@@ -459,6 +467,19 @@ typedef struct _rocblaslt_matrix_transform_desc
  ********************************************************************/
 struct RocblasltContractionProblem
 {
+    struct RocblasltUopcContext
+    {
+        uint32_t valid               = 0;
+        uint32_t mode                = 0;
+        uint32_t effectiveCuCount    = 0;
+        uint32_t effectiveCuBucket   = 0;
+        uint32_t commPressureLevel   = 0;
+        uint32_t overlapWindowType   = 0;
+        uint32_t topologyScope       = 0;
+        uint32_t source              = 0;
+        uint64_t relatedSeqNumber    = 0;
+    };
+
     enum class ScalingFormat
     {
         None = 0,
@@ -551,6 +572,7 @@ struct RocblasltContractionProblem
     void*       Synchronizer;
     bool        swizzleA;
     bool        swizzleB;
+    RocblasltUopcContext uopc{};
 
     // gemm_ex
     // gemm_strided_batched_ex

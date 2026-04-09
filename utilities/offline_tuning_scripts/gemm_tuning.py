@@ -3,38 +3,61 @@ import argparse
 import subprocess
 import time
 
-from utils import parse_input_log, parse_hipblaslt_output, export_csv, dynamic_iters, convert_command
+from utils import (
+    parse_input_log,
+    parse_hipblaslt_output,
+    export_csv,
+    dynamic_iters,
+    convert_command,
+    build_runtime_env,
+)
 
-def run_baseline(input_file, args, tuning_info):
+
+def run_command(command, env):
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "hipblaslt command failed\n"
+            f"command: {command}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
+
+def run_baseline(input_file, args, tuning_info, runtime_env):
     # Delete Tuning File Environment Variable to avoid tuning
     hipblaslt_tuning_file = ""
     if "HIPBLASLT_TUNING_FILE" in os.environ:
         hipblaslt_tuning_file = os.environ["HIPBLASLT_TUNING_FILE"]
         del os.environ["HIPBLASLT_TUNING_FILE"]
+    baseline_env = dict(runtime_env)
+    baseline_env.pop("HIPBLASLT_TUNING_FILE", None)
 
     with open(input_file, 'r') as f, open(args.output_path + '/baseline_reproduce_commands.log', 'w+') as f_out:
         for line in f:
             command = convert_command(line, args, tuning_info, "baseline")
             f_out.write(command + '\n')
-            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            result = run_command(command, baseline_env)
             parse_hipblaslt_output(result.stdout, line, tuning_info, "baseline")
 
     # Restore HIPBLASLT_TUNING_FILE
     if hipblaslt_tuning_file != "":
         os.environ["HIPBLASLT_TUNING_FILE"] = hipblaslt_tuning_file
 
-def run_tuning(input_file, args, tuning_info):
+def run_tuning(input_file, args, tuning_info, runtime_env):
     # set default tuning file if it is not in the environment
     default_tuning_file = False
     if "HIPBLASLT_TUNING_FILE" not in os.environ:
         default_tuning_file = True
         os.environ["HIPBLASLT_TUNING_FILE"] = args.output_path + "/tuning.txt"
+    tuning_env = dict(runtime_env)
+    tuning_env["HIPBLASLT_TUNING_FILE"] = os.environ["HIPBLASLT_TUNING_FILE"]
 
     with open(input_file, 'r') as f, open(args.output_path + '/tuning_reproduce_commands.log', 'w+') as f_out:
         for line in f:
             command = convert_command(line, args, tuning_info, "tuning")
             f_out.write(command + '\n')
-            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            result = run_command(command, tuning_env)
             parse_hipblaslt_output(result.stdout, line, tuning_info, "tuning")
 
     # Remove HIPBLASLT_TUNING_FILE
@@ -60,6 +83,10 @@ def main():
     parser.add_argument("--iters", type=int, default=-1, help="iteration to measure kernel performance")
     parser.add_argument("--gpu_id", type=int, default=0, help="select gpu devices")
     parser.add_argument("--stablize_gpu", action='store_true', help="whether to stablelize GPU frequency")
+    parser.add_argument("--bench_path", type=str, default="", help="Path to hipblaslt-bench; falls back to HIPBLASLT_BENCH_PATH or PATH")
+    parser.add_argument("--bench_library_dir", type=str, default="", help="Path to libhipblaslt directory used with bench_path; falls back to HIPBLASLT_LIBRARY_DIR or an inferred sibling build directory")
+    parser.add_argument("--tensile_libpath", type=str, default="", help="Path to Tensile logic directory; falls back to HIPBLASLT_TENSILE_LIBPATH")
+    parser.add_argument("--max_gemms", type=int, default=-1, help="Limit the number of unique hipblaslt-bench commands used for tuning")
     args = parser.parse_args()
 
     # set_up gpu status
@@ -70,6 +97,7 @@ def main():
 
     tuning_info = dict()
     os.makedirs(args.output_path, exist_ok=True)
+    runtime_env = build_runtime_env(args)
 
     start_time = time.time()
     unique_log_name = parse_input_log(args, tuning_info)
@@ -77,12 +105,12 @@ def main():
     print("parsing time elapsed = {}".format(end_time - start_time))
 
     start_time = time.time()
-    run_baseline(unique_log_name, args, tuning_info)
+    run_baseline(unique_log_name, args, tuning_info, runtime_env)
     end_time = time.time()
     print("baseline time elapsed = {}".format(end_time - start_time))
 
     start_time = time.time()
-    run_tuning(unique_log_name, args, tuning_info)
+    run_tuning(unique_log_name, args, tuning_info, runtime_env)
     end_time = time.time()
     print("tuning time elapsed = {}".format(end_time - start_time))
 

@@ -6,6 +6,8 @@ def parse_input_log(args, tuning_info):
     # save unique lines in hipblaslt log
     unique_log_name = args.output_path + '/unique_' + args.input_file.split('/')[-1]
     f_out = open(unique_log_name, 'w')
+    max_gemms = getattr(args, "max_gemms", -1)
+    unique_count = 0
 
     with open(args.input_file, 'r') as f:
         for line in f:
@@ -16,15 +18,78 @@ def parse_input_log(args, tuning_info):
                 tuning_info[line]['count'] += 1
                 continue
             else:
+                if max_gemms >= 0 and unique_count >= max_gemms:
+                    continue
                 tuning_info[line] = {}
                 tuning_info[line]['count'] = 1
                 f_out.write(line)
+                unique_count += 1
             matches = re.findall(r"-(m|n|k)\s+(\d+)", line)
             matches.extend(re.findall(r"--(lda|ldb|ldc|ldd)\s+(\d+)", line))
             matches.extend(re.findall(r"--(a_type|b_type|c_type|d_type)\s+(\S+)", line))
             tuning_info[line].update({key: value for key, value in matches})
 
     return unique_log_name
+
+def resolve_bench_command(args):
+    bench_path = getattr(args, "bench_path", "")
+    if bench_path:
+        return bench_path
+
+    env_path = os.environ.get("HIPBLASLT_BENCH_PATH", "")
+    if env_path:
+        return env_path
+
+    return "hipblaslt-bench"
+
+def resolve_bench_library_dir(args):
+    bench_library_dir = getattr(args, "bench_library_dir", "")
+    if bench_library_dir:
+        return bench_library_dir
+
+    env_dir = os.environ.get("HIPBLASLT_LIBRARY_DIR", "")
+    if env_dir:
+        return env_dir
+
+    bench_command = resolve_bench_command(args)
+    if os.path.sep not in bench_command:
+        return ""
+
+    bench_dir = os.path.dirname(os.path.abspath(bench_command))
+    candidates = [
+        os.path.join(os.path.dirname(bench_dir), "library"),
+        os.path.join(os.path.dirname(os.path.dirname(bench_dir)), "library"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+
+    return ""
+
+def resolve_tensile_libpath(args):
+    tensile_libpath = getattr(args, "tensile_libpath", "")
+    if tensile_libpath:
+        return tensile_libpath
+
+    return os.environ.get("HIPBLASLT_TENSILE_LIBPATH", "")
+
+def build_runtime_env(args):
+    env = os.environ.copy()
+
+    bench_library_dir = resolve_bench_library_dir(args)
+    if bench_library_dir:
+        existing_ld_library_path = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = (
+            bench_library_dir
+            if not existing_ld_library_path
+            else f"{bench_library_dir}:{existing_ld_library_path}"
+        )
+
+    tensile_libpath = resolve_tensile_libpath(args)
+    if tensile_libpath:
+        env["HIPBLASLT_TENSILE_LIBPATH"] = tensile_libpath
+
+    return env
 
 def parse_hipblaslt_output(output, line, tuning_info, mode):
     outputs = output.split('\n')
@@ -72,9 +137,11 @@ def convert_command(input_cmd, args, tuning_info, mode):
     requested_solution = args.requested_solution
     iters = args.iters
     cold_iters = args.cold_iters
+    bench_command = resolve_bench_command(args)
 
     output_cmd = input_cmd.strip()
     cold_iters, iters = dynamic_iters(input_cmd, cold_iters, iters, tuning_info)
+    output_cmd = re.sub(r"^\s*hipblaslt-bench\b", bench_command, output_cmd, count=1)
 
     output_cmd = re.sub(f'--algo_method\s+\S+', '', output_cmd)
     output_cmd = re.sub(f'--solution_index\s+\S+', '', output_cmd)

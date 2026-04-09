@@ -32,7 +32,7 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(HIPBLASLT_HAS_ROCM_SMI)
 
 #include <hip/hip_runtime.h>
 #include <rocm_smi/rocm_smi.h>
@@ -103,7 +103,7 @@ public:
     // deleting copy constructor
     EfficiencyMonitorImp(const EfficiencyMonitorImp& obj) = delete;
 
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(HIPBLASLT_HAS_ROCM_SMI)
 
     bool enabled()
     {
@@ -524,9 +524,9 @@ private:
     uint64_t                           m_MEMCLK_sum;
     std::vector<uint64_t>              m_MEMCLK_array;
 
-#else // WIN32
+#else // !_WIN32 || !HIPBLASLT_HAS_ROCM_SMI
 
-    // not supporting windows for now
+    // Fall back to a no-op monitor when ROCm SMI is unavailable.
 
 public:
     EfficiencyMonitorImp() {}

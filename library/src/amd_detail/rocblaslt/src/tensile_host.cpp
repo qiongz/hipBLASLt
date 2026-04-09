@@ -54,7 +54,12 @@
 #include <Tensile/hip/HipUtils.hpp>
 
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 #include <complex>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
@@ -262,6 +267,84 @@ RocblasltContractionProblem::RocblasltContractionProblem(hipblasOperation_t     
 
 namespace
 {
+    inline bool uopcDebugEnabled()
+    {
+        const auto* rawValue = std::getenv("UOPC_DUMP_HINTS");
+        return rawValue != nullptr && rawValue[0] != '\0' && std::strcmp(rawValue, "0") != 0
+               && std::strcmp(rawValue, "false") != 0 && std::strcmp(rawValue, "off") != 0;
+    }
+
+    template <typename Problem>
+    inline uint32_t getProblemUopcEffectiveCuCount(const Problem&)
+    {
+        return 0;
+    }
+
+    inline uint32_t getProblemUopcEffectiveCuCount(const RocblasltContractionProblem& prob)
+    {
+        return (prob.uopc.valid && prob.uopc.effectiveCuCount > 0) ? prob.uopc.effectiveCuCount : 0;
+    }
+
+    inline void setAlgoStoredEffectiveCuCount(rocblaslt_matmul_algo& algo, uint32_t effectiveCuCount)
+    {
+        std::memcpy(algo.data + sizeof(uint32_t), &effectiveCuCount, sizeof(uint32_t));
+    }
+
+    inline uint32_t getAlgoStoredEffectiveCuCount(const rocblaslt_matmul_algo& algo)
+    {
+        uint32_t effectiveCuCount = 0;
+        std::memcpy(&effectiveCuCount, algo.data + sizeof(uint32_t), sizeof(uint32_t));
+        return effectiveCuCount;
+    }
+
+    template <typename Problem>
+    inline uint32_t getUopcEffectiveCuCount(const Problem&              prob,
+                                            const rocblaslt_matmul_algo* algo = nullptr)
+    {
+        const auto algoCuCount = algo != nullptr ? getAlgoStoredEffectiveCuCount(*algo) : 0;
+        if(algoCuCount > 0)
+            return algoCuCount;
+
+        const auto problemCuCount = getProblemUopcEffectiveCuCount(prob);
+        if(problemCuCount > 0)
+            return problemCuCount;
+
+        return 0;
+    }
+
+    template <typename Problem>
+    inline void applyUopcHardwareOverride(const Problem& prob,
+                                          std::shared_ptr<TensileLite::Hardware>& hardware,
+                                          const rocblaslt_matmul_algo* algo = nullptr)
+    {
+        const auto effectiveCuCount = getUopcEffectiveCuCount(prob, algo);
+        if(effectiveCuCount == 0 || !hardware)
+            return;
+
+        auto amdGpu = std::dynamic_pointer_cast<TensileLite::AMDGPU>(hardware);
+        if(!amdGpu)
+            return;
+
+        const auto originalCuCount = static_cast<uint32_t>(amdGpu->computeUnitCount);
+        if(effectiveCuCount > originalCuCount)
+            return;
+
+        amdGpu->computeUnitCount = static_cast<int>(effectiveCuCount);
+        amdGpu->isStandardCUs    = -1;
+
+        if(uopcDebugEnabled())
+        {
+            const auto algoCuCount
+                = algo != nullptr ? getAlgoStoredEffectiveCuCount(*algo) : 0;
+            std::fprintf(stderr,
+                         "[hipblaslt][uopc] applyHardwareOverride source=%s originalCu=%u "
+                         "effectiveCu=%u\n",
+                         algoCuCount > 0 ? "algo" : "problem",
+                         originalCuCount,
+                         effectiveCuCount);
+        }
+    }
+
     static void assignAlphaBeta(rocisa::DataType type,
                                 const void*      alphaPtr,
                                 const void*      betaPtr,
@@ -364,6 +447,32 @@ namespace
             break;
         }
         return false;
+    }
+
+    inline std::string activationTypeToOverrideKey(TensileLite::ActivationType activationType)
+    {
+        auto key = TensileLite::ToString(activationType);
+        std::transform(
+            key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+        return key;
+    }
+
+    inline int getOverrideBiasVector(const RocblasltContractionProblem& problem)
+    {
+        return tensileUseBias(problem.epilogue) ? 1 : 0;
+    }
+
+    inline rocisa::DataType getOverrideBiasType(const RocblasltContractionProblem& problem)
+    {
+        return getOverrideBiasVector(problem) > 0
+                   ? hipDataType_to_tensile_type(problem.bias_type)
+                   : rocisa::DataType::None;
+    }
+
+    inline rocisa::DataType getOverrideAuxType(const RocblasltContractionProblem& problem)
+    {
+        return is_e_enabled(problem.epilogue) ? hipDataType_to_tensile_type(problem.aux_type)
+                                              : rocisa::DataType::None;
     }
 
     rocisa::DataType hip2TensileType(hipDataType type)
@@ -2349,6 +2458,7 @@ namespace
 struct TensileDataGemm
 {
     bool                                       enableEpilogue = true;
+    uint32_t                                   effectiveCuCount = 0;
     TensileLite::ContractionProblemGemm        problem;
     TensileLite::ContractionInputs             inputs;
     std::vector<TensileLite::KernelInvocation> kernels;
@@ -2368,7 +2478,9 @@ struct TensileDataGroupedGemm
 };
 
 TensileLite::ProblemOverride
-    RocblasltContractionProblem2ProblemOverride(const RocblasltContractionProblem& problem)
+    RocblasltContractionProblem2ProblemOverride(const RocblasltContractionProblem& problem,
+                                                const std::string&                 arch,
+                                                uint32_t                           cuCount)
 {
     return TensileLite::ProblemOverride(problem.trans_a == HIPBLAS_OP_N ? false : true,
                                         problem.trans_b == HIPBLAS_OP_N ? false : true,
@@ -2379,27 +2491,33 @@ TensileLite::ProblemOverride
                                         problem.m,
                                         problem.n,
                                         problem.k,
-                                        problem.batch_count);
+                                        problem.batch_count,
+                                        arch,
+                                        cuCount,
+                                        getOverrideBiasVector(problem),
+                                        getOverrideBiasType(problem),
+                                        getOverrideAuxType(problem),
+                                        activationTypeToOverrideKey(
+                                            getTensileActivationType(problem.epilogue)));
 }
 
-TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<void> gemmData)
+TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<void>  gemmData,
+                                                             const std::string&     arch,
+                                                             uint32_t               cuCount)
 {
     std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
-    rocisa::DataType                 computeType      = rocisa::DataType::None;
-    rocisa::DataType                 computeInputType = data->problem.computeInputType();
+    rocisa::DataType                 computeType      = data->problem.computeType();
+    const auto                       resolvedCuCount  = cuCount > 0 ? cuCount : data->effectiveCuCount;
+    const auto                       biasVector       = data->problem.useBias();
+    const auto                       biasType = biasVector > 0 ? data->problem.bias().dataType()
+                                                               : rocisa::DataType::None;
+    const auto auxType
+        = data->problem.useE() ? data->problem.e().dataType() : rocisa::DataType::None;
+    const auto activationType = activationTypeToOverrideKey(data->problem.activationType());
 
     if(data->problem.f32XdlMathOp() == rocisa::DataType::XFloat32)
     {
         computeType = rocisa::DataType::XFloat32;
-    }
-    else if(computeInputType == rocisa::DataType::BFloat16
-            || computeInputType == rocisa::DataType::Half)
-    {
-        computeType = computeInputType;
-    }
-    else
-    {
-        computeType = data->problem.computeType();
     }
 
     return TensileLite::ProblemOverride(data->problem.transA(),
@@ -2411,7 +2529,19 @@ TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<voi
                                         data->problem.freeSizeA(0),
                                         data->problem.freeSizeB(0),
                                         data->problem.boundSize(0),
-                                        data->problem.batchSize(0));
+                                        data->problem.batchSize(0),
+                                        arch,
+                                        resolvedCuCount,
+                                        biasVector,
+                                        biasType,
+                                        auxType,
+                                        activationType);
+}
+
+uint32_t TensileDataGemmEffectiveCuCount(std::shared_ptr<void> gemmData)
+{
+    std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
+    return data->effectiveCuCount;
 }
 
 TensileLite::ContractionProblemGemm* ExtractProblemGemm(std::shared_ptr<void> gemmData)
@@ -2523,6 +2653,7 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
         }
 
         hardware = TensileLite::hip::GetDevice(*deviceProp);
+        applyUopcHardwareOverride(prob, hardware, algo);
 
         std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
         rocblaslt_matmul_heuristic_result heuristicResult;
@@ -2746,6 +2877,7 @@ rocblaslt_status gemmCreate(RocblasltContractionProblem const& problem,
             updateTensileProblem(problem, data->problem);
             data->inputs         = GetTensileInputs(problem);
             data->enableEpilogue = problem.epilogue == ROCBLASLT_EPILOGUE_DEFAULT ? false : true;
+            data->effectiveCuCount = getProblemUopcEffectiveCuCount(problem);
         }
         else
         {
@@ -2753,6 +2885,7 @@ rocblaslt_status gemmCreate(RocblasltContractionProblem const& problem,
             data.problem        = ConstructTensileProblem(problem);
             data.inputs         = GetTensileInputs(problem);
             data.enableEpilogue = problem.epilogue == ROCBLASLT_EPILOGUE_DEFAULT ? false : true;
+            data.effectiveCuCount = getProblemUopcEffectiveCuCount(problem);
 
             gemmData = std::static_pointer_cast<void>(std::make_shared<TensileDataGemm>(data));
         }
@@ -3459,6 +3592,7 @@ void _convertToHeuristicResultArray(
     rocblaslt_matmul_heuristic_result                               heuristicResultsArray[],
     int*                                                            returnAlgoCount,
     size_t                                                          maxWorkSpaceBytes,
+    uint32_t                                                        effectiveCuCount,
     const TensileLite::ContractionProblemGemm&                      problem,
     const TensileLite::Hardware&                                    hardware)
 {
@@ -3469,6 +3603,7 @@ void _convertToHeuristicResultArray(
         memset(heuristicResultsArray[i].algo.data, 0, sizeof(heuristicResultsArray[i].algo.data));
         int* solutionIndex = (int*)(heuristicResultsArray[i].algo.data);
         *solutionIndex     = solution->index;
+        setAlgoStoredEffectiveCuCount(heuristicResultsArray[i].algo, effectiveCuCount);
         heuristicResultsArray[i].algo.max_workspace_bytes = maxWorkSpaceBytes;
         heuristicResultsArray[i].algo.fallback            = false;
         heuristicResultsArray[i].state                    = rocblaslt_status_success;
@@ -3514,6 +3649,7 @@ std::vector<std::shared_ptr<TensileLite::ContractionSolution>>
     }
 
     hardware = TensileLite::hip::GetDevice(*deviceProp);
+    applyUopcHardwareOverride(prob, hardware);
 
     std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
     updateTensileProblem(prob, data->problem);
@@ -3566,6 +3702,7 @@ rocblaslt_status getBestSolutions(RocblasltContractionProblem const& prob,
     }
 
     hardware = TensileLite::hip::GetDevice(*deviceProp);
+    applyUopcHardwareOverride(prob, hardware);
 
     std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
     updateTensileProblem(prob, data->problem);
@@ -3591,6 +3728,7 @@ rocblaslt_status getBestSolutions(RocblasltContractionProblem const& prob,
                                    heuristicResultsArray,
                                    returnAlgoCount,
                                    maxWorkSpaceBytes,
+                                   getProblemUopcEffectiveCuCount(prob),
                                    data->problem,
                                    *hardware);
 
@@ -3620,6 +3758,7 @@ rocblaslt_status getAllSolutions(MyProblem&                                     
     std::string deviceString = deviceFullString.substr(0, deviceFullString.find(":"));
 
     hardware = TensileLite::hip::GetDevice(*deviceProp);
+    applyUopcHardwareOverride(prob, hardware);
 
     std::set<std::shared_ptr<TensileLite::ContractionSolution>> solutions;
     std::shared_ptr<void>                                       tensile_prob;
@@ -3669,6 +3808,8 @@ rocblaslt_status getAllSolutions(MyProblem&                                     
         memset(heuristicResults[i].algo.data, 0, sizeof(heuristicResults[i].algo.data));
         int* solutionIndex                           = (int*)(heuristicResults[i].algo.data);
         *solutionIndex                               = solution->index;
+        setAlgoStoredEffectiveCuCount(heuristicResults[i].algo,
+                                      getProblemUopcEffectiveCuCount(prob));
         heuristicResults[i].algo.max_workspace_bytes = maxWorkSpaceBytes;
         heuristicResults[i].algo.fallback            = false;
         heuristicResults[i].state                    = rocblaslt_status_success;
@@ -3814,6 +3955,7 @@ rocblaslt_status isSolutionSupported(rocblaslt_handle       handle,
     }
 
     hardware              = TensileLite::hip::GetDevice(*deviceProp);
+    applyUopcHardwareOverride(inputs, hardware, algo);
     *workspaceSizeInBytes = 0;
 
     int* solutionIndex = (int*)algo->data;
@@ -4109,6 +4251,7 @@ rocblaslt_status getBestSolutions(rocblaslt_handle       handle,
                                        heuristicResults.data(),
                                        &returnAlgoCount,
                                        workspaceBytes,
+                                       0,
                                        data->problem,
                                        *hardware);
     }
@@ -4135,6 +4278,7 @@ rocblaslt_status getBestSolutions(rocblaslt_handle       handle,
                                        heuristicResults.data(),
                                        &returnAlgoCount,
                                        workspaceBytes,
+                                       0,
                                        data->problem.gemms[0],
                                        *hardware);
     }

@@ -26,6 +26,8 @@
  * ************************************************************************ */
 
 #include "UserDrivenTuningParser.hpp"
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <shared_mutex>
 #include <sstream>
@@ -58,11 +60,73 @@ namespace TensileLite
             return "c_type";
         case HeaderFields::compute_type:
             return "compute_type";
+        case HeaderFields::activation_type:
+            return "activation_type";
+        case HeaderFields::bias_vector:
+            return "bias_vector";
+        case HeaderFields::bias_type:
+            return "bias_type";
+        case HeaderFields::aux_type:
+            return "aux_type";
         case HeaderFields::solution_index:
             return "solution_index";
+        case HeaderFields::gcn_arch_name:
+            return "gcnArchName";
+        case HeaderFields::cu_count:
+            return "CUs";
         default:
             return "";
         }
+    }
+
+    inline std::string normalizeArchName(const std::string& archName)
+    {
+        const auto first = archName.find_first_not_of(" \t\n\r\f\v");
+        if(first == std::string::npos)
+            return "";
+
+        const auto last = archName.find_last_not_of(" \t\n\r\f\v");
+        auto       arch = archName.substr(first, last - first + 1);
+        const auto pos  = arch.find(':');
+        if(pos != std::string::npos)
+            arch.erase(pos);
+
+        return arch;
+    }
+
+    inline std::string trimToken(const std::string& value)
+    {
+        const auto first = value.find_first_not_of(" \t\n\r\f\v");
+        if(first == std::string::npos)
+            return "";
+
+        const auto last = value.find_last_not_of(" \t\n\r\f\v");
+        return value.substr(first, last - first + 1);
+    }
+
+    inline std::string normalizeToken(const std::string& value)
+    {
+        auto normalized = trimToken(value);
+        std::transform(normalized.begin(),
+                       normalized.end(),
+                       normalized.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return normalized;
+    }
+
+    inline bool parseHeaderField(const std::string& header, HeaderFields& outField)
+    {
+        const auto normalizedHeader = trimToken(header);
+        for(size_t idx = 0; idx < static_cast<size_t>(HeaderFields::count); ++idx)
+        {
+            const auto field = static_cast<HeaderFields>(idx);
+            if(normalizedHeader == HeaderFieldToString(field))
+            {
+                outField = field;
+                return true;
+            }
+        }
+        return false;
     }
 
     void getContractionProblemsFromFile(const std::string& path)
@@ -91,24 +155,19 @@ namespace TensileLite
                     if(std::getline(file_read, value_line))
                     {
                         value_line.erase(0, value_line.find_first_not_of(" \t\n\r\f\v"));
-                        std::vector<std::string> entries{};
-                        entries.reserve(
-                            static_cast<size_t>(static_cast<size_t>(HeaderFields::count)));
+                        std::vector<std::string> entries(
+                            static_cast<size_t>(HeaderFields::count));
                         std::stringstream header_split(header_line);
                         std::stringstream value_split(value_line);
 
                         while(std::getline(header_split, header, delim)
                               && std::getline(value_split, value, delim))
                         {
-                            if(header == HeaderFieldToString(current_field))
+                            HeaderFields parsedField;
+                            if(parseHeaderField(header, parsedField))
                             {
-                                entries.push_back(value);
-                                current_field = static_cast<HeaderFields>(
-                                    static_cast<int>(current_field) + 1);
+                                entries[static_cast<size_t>(parsedField)] = trimToken(value);
                             }
-
-                            if(current_field == HeaderFields::count)
-                                break;
                         }
 
                         auto problemSolution = problemFromEntries(entries);
@@ -148,15 +207,20 @@ namespace TensileLite
             return std::make_pair(ProblemOverride{}, -1);
         }
 
-        //Expected format: transA,transB,batch_count,M,N,K,input_type,output_type,compute_type,solution_index
-        bool transA = (entries[static_cast<size_t>(HeaderFields::transA)] != "N");
-        bool transB = (entries[static_cast<size_t>(HeaderFields::transB)] != "N");
+        bool transA = (normalizeToken(entries[static_cast<size_t>(HeaderFields::transA)]) != "n");
+        bool transB = (normalizeToken(entries[static_cast<size_t>(HeaderFields::transB)]) != "n");
 
         size_t           m, n, b, k;
         rocisa::DataType inputTypeA  = rocisa::DataType::None;
         rocisa::DataType inputTypeB  = rocisa::DataType::None;
         rocisa::DataType outputType  = rocisa::DataType::None;
         rocisa::DataType computeType = rocisa::DataType::None;
+        rocisa::DataType biasType    = rocisa::DataType::None;
+        rocisa::DataType auxType     = rocisa::DataType::None;
+        std::string      archName;
+        std::string      activationType = "none";
+        size_t           cuCount = 0;
+        int              biasVector = 0;
 
         int solution_idx = -1;
 
@@ -165,20 +229,60 @@ namespace TensileLite
 
             // TODO: are any additional mapping parameters needed?
 
-            b          = std::stol(entries[static_cast<size_t>(HeaderFields::batch_count)]);
-            m          = std::stol(entries[static_cast<size_t>(HeaderFields::m)]);
-            n          = std::stol(entries[static_cast<size_t>(HeaderFields::n)]);
-            k          = std::stol(entries[static_cast<size_t>(HeaderFields::k)]);
+            b = std::stol(trimToken(entries[static_cast<size_t>(HeaderFields::batch_count)]));
+            m = std::stol(trimToken(entries[static_cast<size_t>(HeaderFields::m)]));
+            n = std::stol(trimToken(entries[static_cast<size_t>(HeaderFields::n)]));
+            k = std::stol(trimToken(entries[static_cast<size_t>(HeaderFields::k)]));
             inputTypeA = hipDataType_to_tensile_type(
-                string_to_hip_datatype(entries[static_cast<size_t>(HeaderFields::a_type)]));
+                string_to_hip_datatype(trimToken(entries[static_cast<size_t>(HeaderFields::a_type)])));
             inputTypeB = hipDataType_to_tensile_type(
-                string_to_hip_datatype(entries[static_cast<size_t>(HeaderFields::b_type)]));
+                string_to_hip_datatype(trimToken(entries[static_cast<size_t>(HeaderFields::b_type)])));
             outputType = hipDataType_to_tensile_type(
-                string_to_hip_datatype(entries[static_cast<size_t>(HeaderFields::c_type)]));
+                string_to_hip_datatype(trimToken(entries[static_cast<size_t>(HeaderFields::c_type)])));
             computeType = rocComputeType_to_tensile_type(
                 (rocblaslt_compute_type)string_to_hipblas_computetype(
-                    entries[static_cast<size_t>(HeaderFields::compute_type)]));
-            solution_idx = std::stoi(entries[static_cast<size_t>(HeaderFields::solution_index)]);
+                    trimToken(entries[static_cast<size_t>(HeaderFields::compute_type)])));
+
+            const auto activationEntry
+                = normalizeToken(entries[static_cast<size_t>(HeaderFields::activation_type)]);
+            if(!activationEntry.empty())
+                activationType = activationEntry;
+
+            const auto biasVectorEntry
+                = trimToken(entries[static_cast<size_t>(HeaderFields::bias_vector)]);
+            if(!biasVectorEntry.empty())
+                biasVector = std::stoi(biasVectorEntry);
+
+            if(biasVector > 0)
+            {
+                const auto biasTypeEntry
+                    = trimToken(entries[static_cast<size_t>(HeaderFields::bias_type)]);
+                if(!biasTypeEntry.empty())
+                {
+                    biasType = hipDataType_to_tensile_type(
+                        string_to_hip_datatype(biasTypeEntry));
+                }
+            }
+
+            if(activationType != "none")
+            {
+                const auto auxTypeEntry = trimToken(entries[static_cast<size_t>(HeaderFields::aux_type)]);
+                if(!auxTypeEntry.empty())
+                {
+                    auxType = hipDataType_to_tensile_type(string_to_hip_datatype(auxTypeEntry));
+                }
+            }
+
+            solution_idx = std::stoi(trimToken(entries[static_cast<size_t>(HeaderFields::solution_index)]));
+
+            const auto archEntry = trimToken(entries[static_cast<size_t>(HeaderFields::gcn_arch_name)]);
+            if(!archEntry.empty())
+            {
+                archName = normalizeArchName(archEntry);
+                const auto& cuCountEntry = entries[static_cast<size_t>(HeaderFields::cu_count)];
+                if(!cuCountEntry.empty())
+                    cuCount = std::stoul(trimToken(cuCountEntry));
+            }
         }
         catch(std::invalid_argument const& ex)
         {
@@ -196,7 +300,22 @@ namespace TensileLite
         }
 
         ProblemOverride po(
-            transA, transB, inputTypeA, inputTypeB, computeType, outputType, m, n, k, b);
+            transA,
+            transB,
+            inputTypeA,
+            inputTypeB,
+            computeType,
+            outputType,
+            m,
+            n,
+            k,
+            b,
+            archName,
+            cuCount,
+            biasVector,
+            biasType,
+            auxType,
+            activationType);
 
         return std::make_pair(po, solution_idx);
     }
@@ -212,6 +331,12 @@ namespace TensileLite
         , m_n(0)
         , m_k(0)
         , m_batchSize(0)
+        , m_arch("")
+        , m_cuCount(0)
+        , m_biasVector(0)
+        , m_biasType(rocisa::DataType::None)
+        , m_auxType(rocisa::DataType::None)
+        , m_activationType("none")
     {
     }
 
@@ -224,7 +349,13 @@ namespace TensileLite
                                      size_t           m,
                                      size_t           n,
                                      size_t           k,
-                                     size_t           batchSize)
+                                     size_t           batchSize,
+                                     std::string      arch,
+                                     size_t           cuCount,
+                                     int              biasVector,
+                                     rocisa::DataType biasType,
+                                     rocisa::DataType auxType,
+                                     std::string      activationType)
         : m_transA(transA)
         , m_transB(transB)
         , m_inputTypeA(inputTypeA)
@@ -235,6 +366,12 @@ namespace TensileLite
         , m_n(n)
         , m_k(k)
         , m_batchSize(batchSize)
+        , m_arch(normalizeArchName(arch))
+        , m_cuCount(cuCount)
+        , m_biasVector(biasVector)
+        , m_biasType(biasType)
+        , m_auxType(auxType)
+        , m_activationType(normalizeToken(activationType))
     {
     }
 
@@ -251,6 +388,12 @@ namespace TensileLite
         m_n           = problem.n();
         m_k           = problem.k();
         m_batchSize   = problem.batchSize();
+        m_arch        = problem.arch();
+        m_cuCount     = problem.cuCount();
+        m_biasVector  = problem.biasVector();
+        m_biasType    = problem.biasType();
+        m_auxType     = problem.auxType();
+        m_activationType = problem.activationType();
     }
 
 };

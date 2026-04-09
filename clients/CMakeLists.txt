@@ -23,6 +23,7 @@ target_link_libraries(hipblaslt-clients-common
     PUBLIC
         roc::hipblaslt
         OpenMP::OpenMP_CXX
+        ${BLAS_LIBRARIES}
         ${LAPACK_LIBRARIES}
     PRIVATE
         hip::device
@@ -33,7 +34,26 @@ if(HIPBLASLT_ENABLE_ROCROLLER)
         if(HIPBLASLT_ENABLE_THEROCK)
             find_package(mxDataGenerator REQUIRED)
         else()
-            add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../shared/mxdatagenerator" "${CMAKE_CURRENT_BINARY_DIR}/mxdatagenerator")
+            set(_hipblaslt_mxdatagenerator_candidates
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../../shared/mxdatagenerator"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../../shared/mxDataGenerator"
+                "${PROJECT_SOURCE_DIR}/../shared/mxdatagenerator"
+                "${PROJECT_SOURCE_DIR}/../shared/mxDataGenerator")
+            set(_hipblaslt_mxdatagenerator_source "")
+            foreach(candidate IN LISTS _hipblaslt_mxdatagenerator_candidates)
+                if(EXISTS "${candidate}/CMakeLists.txt")
+                    set(_hipblaslt_mxdatagenerator_source "${candidate}")
+                    break()
+                endif()
+            endforeach()
+
+            if(NOT _hipblaslt_mxdatagenerator_source)
+                list(JOIN _hipblaslt_mxdatagenerator_candidates "\n  - " _hipblaslt_mxdatagenerator_text)
+                message(FATAL_ERROR
+                    "Could not locate mxDataGenerator. Tried:\n  - ${_hipblaslt_mxdatagenerator_text}")
+            endif()
+
+            add_subdirectory("${_hipblaslt_mxdatagenerator_source}" "${CMAKE_CURRENT_BINARY_DIR}/mxdatagenerator")
         endif()
     endif()
     target_compile_definitions(hipblaslt-clients-common PRIVATE HIPBLASLT_USE_ROCROLLER)

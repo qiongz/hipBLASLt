@@ -50,11 +50,1027 @@
 #include "utility.hpp"
 
 #include <hip/hip_runtime_api.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
 #include <utility>
+#include <vector>
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+#include <uopc/uopc.h>
+#endif
 
 #define TO_STR2(x) #x
 #define TO_STR(x) TO_STR2(x)
+
+namespace
+{
+    constexpr uint32_t kUopcHintSourceController = 1;
+    constexpr uint32_t kUopcHintSourcePreference = 2;
+
+    inline void recordRuntimeHintTelemetry(bool success, bool controllerSource);
+
+    inline bool overrideTelemetryEnabled()
+    {
+        static const bool enabled = [] {
+            const auto* rawValue = std::getenv("HIPBLASLT_OVERRIDE_TELEMETRY");
+            return rawValue != nullptr && rawValue[0] != '\0' && std::strcmp(rawValue, "0") != 0
+                   && std::strcmp(rawValue, "false") != 0 && std::strcmp(rawValue, "off") != 0
+                   && std::strcmp(rawValue, "no") != 0;
+        }();
+        return enabled;
+    }
+
+    inline uint64_t overrideTelemetryFlushCalls()
+    {
+        static const uint64_t flushCalls = [] {
+            const auto* rawValue = std::getenv("HIPBLASLT_OVERRIDE_TELEMETRY_FLUSH_CALLS");
+            if(rawValue == nullptr || rawValue[0] == '\0')
+                return uint64_t(0);
+
+            char*      endPtr = nullptr;
+            const auto value  = std::strtoull(rawValue, &endPtr, 10);
+            if(endPtr == rawValue || (endPtr != nullptr && *endPtr != '\0'))
+                return uint64_t(0);
+            return static_cast<uint64_t>(value);
+        }();
+        return flushCalls;
+    }
+
+    inline const char* overrideTelemetryRank()
+    {
+        const auto* rank = std::getenv("RANK");
+        return rank != nullptr && rank[0] != '\0' ? rank : "?";
+    }
+
+    inline const char* overrideTelemetryLocalRank()
+    {
+        const auto* localRank = std::getenv("LOCAL_RANK");
+        return localRank != nullptr && localRank[0] != '\0' ? localRank : "?";
+    }
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+    inline bool uopcDebugEnabled()
+    {
+        const auto* rawValue = std::getenv("UOPC_DUMP_HINTS");
+        return rawValue != nullptr && rawValue[0] != '\0' && std::strcmp(rawValue, "0") != 0
+               && std::strcmp(rawValue, "false") != 0 && std::strcmp(rawValue, "off") != 0;
+    }
+
+    inline bool uopcEnabled()
+    {
+        static const bool enabled = [] {
+            const auto* rawValue = std::getenv("UOPC_ENABLE");
+            return rawValue == nullptr || rawValue[0] == '\0'
+                   || (std::strcmp(rawValue, "0") != 0 && std::strcmp(rawValue, "false") != 0
+                       && std::strcmp(rawValue, "off") != 0 && std::strcmp(rawValue, "no") != 0);
+        }();
+        return enabled;
+    }
+
+    inline bool isBackwardOverlapWindow(uopcOverlapWindowType_t window)
+    {
+        switch(window)
+        {
+        case UOPC_WINDOW_BACKWARD_AR_VS_NEXT_GEMM:
+        case UOPC_WINDOW_BACKWARD_RS_VS_NEXT_GRAD:
+        case UOPC_WINDOW_BACKWARD_PREFETCH_AG_VS_CURRENT_GRAD:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    inline const char* runtimeHintRejectReason(const GemmOverlapHintV1& hint, uint32_t visibleCuCount)
+    {
+        if(hint.source != UOPC_HINT_SOURCE_CONTROLLER)
+            return "non_controller_source";
+        if(hint.relatedSeqNumber == 0)
+            return "missing_related_seq";
+        if(!isBackwardOverlapWindow(hint.overlapWindowType))
+            return "non_backward_window";
+        if(hint.mode == UOPC_HINT_MODE_NONE)
+            return "mode_none";
+        if(hint.effectiveCuUpperBound == 0)
+            return "missing_effective_cu";
+        if(visibleCuCount > 0 && hint.effectiveCuUpperBound >= visibleCuCount)
+            return "not_reduced_cu";
+        return nullptr;
+    }
+
+    inline void dumpRuntimeHintTrace(const char*                        path,
+                                     const RocblasltContractionProblem& prob,
+                                     const GemmHintQueryV1&            query,
+                                     const GemmOverlapHintV1*          hint,
+                                     uopcStatus_t                      status,
+                                     bool                              accepted,
+                                     const char*                       reason,
+                                     uint32_t                          visibleCuCount)
+    {
+        if(!uopcDebugEnabled())
+            return;
+
+        std::fprintf(stderr,
+                     "[hipblaslt][uopc-trace] rank=%s local_rank=%s event=hint path=%s "
+                     "accepted=%u reason=%s status=%u source=%u mode=%u bucket=%u upper=%u "
+                     "pressure=%u window=%u topo=%u related_seq=%llu stream=%llu grouped=%u "
+                     "m=%llu n=%llu k=%llu visible_cu=%u\n",
+                     overrideTelemetryRank(),
+                     overrideTelemetryLocalRank(),
+                     path,
+                     accepted ? 1U : 0U,
+                     reason != nullptr ? reason : "none",
+                     static_cast<unsigned>(status),
+                     hint != nullptr ? static_cast<unsigned>(hint->source) : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->mode) : 0U,
+                     hint != nullptr ? hint->effectiveCuBucket : 0U,
+                     hint != nullptr ? hint->effectiveCuUpperBound : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->commPressureLevel) : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->overlapWindowType) : 0U,
+                     hint != nullptr ? static_cast<unsigned>(hint->topologyScope) : 0U,
+                     hint != nullptr ? static_cast<unsigned long long>(hint->relatedSeqNumber) : 0ULL,
+                     static_cast<unsigned long long>(query.streamUid),
+                     prob.grouped_gemm ? 1U : 0U,
+                     static_cast<unsigned long long>(prob.m),
+                     static_cast<unsigned long long>(prob.n),
+                     static_cast<unsigned long long>(prob.k),
+                     visibleCuCount);
+    }
+#endif
+
+    inline bool hasUopcPreference(const rocblaslt_matmul_preference pref)
+    {
+        return pref != nullptr
+               && (pref->overlap_mode || pref->effective_cu_count || pref->effective_cu_bucket
+                   || pref->comm_pressure_level || pref->topology_scope
+                   || pref->policy_hint_version);
+    }
+
+    inline void applyUopcPreferenceToProblem(const rocblaslt_matmul_preference pref,
+                                             RocblasltContractionProblem&      prob)
+    {
+        if(!hasUopcPreference(pref))
+            return;
+
+        prob.uopc.valid             = 1;
+        prob.uopc.mode              = pref->overlap_mode;
+        prob.uopc.effectiveCuCount  = pref->effective_cu_count;
+        prob.uopc.effectiveCuBucket = pref->effective_cu_bucket;
+        prob.uopc.commPressureLevel = pref->comm_pressure_level;
+        prob.uopc.topologyScope     = pref->topology_scope;
+        prob.uopc.source            = kUopcHintSourcePreference;
+    }
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+    inline void applyRuntimeUopcHint(rocblaslt_handle handle, RocblasltContractionProblem& prob)
+    {
+        if(prob.uopc.valid)
+            return;
+        if(!uopcEnabled())
+            return;
+
+        GemmHintQueryV1   query{};
+        GemmOverlapHintV1 hint{};
+
+        query.version        = UOPC_ABI_VERSION;
+        query.device         = handle->device;
+        query.streamUid      = 0;
+        query.computeBackend = UOPC_BACKEND_HIPBLASLT;
+        query.problemClass
+            = prob.grouped_gemm ? UOPC_PROBLEM_GROUPED_GEMM : UOPC_PROBLEM_GEMM;
+        query.m = prob.m;
+        query.n = prob.n;
+        query.k = prob.k;
+        query.semanticFlags = UOPC_GEMM_SEMANTIC_NONE;
+        if(prob.gradient)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_GRADIENT_EPILOGUE;
+        if(prob.grouped_gemm)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_GROUPED;
+        if(prob.trans_a != HIPBLAS_OP_N)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_TRANS_A;
+        if(prob.trans_b != HIPBLAS_OP_N)
+            query.semanticFlags |= UOPC_GEMM_SEMANTIC_TRANS_B;
+
+        const auto status = uopcQueryGemmHint(&query, &hint);
+        const auto visibleCuCount
+            = handle != nullptr && handle->properties.multiProcessorCount > 0
+                  ? static_cast<uint32_t>(handle->properties.multiProcessorCount)
+                  : 0U;
+        if(status == UOPC_STATUS_SUCCESS && hint.valid)
+        {
+            recordRuntimeHintTelemetry(true, hint.source == UOPC_HINT_SOURCE_CONTROLLER);
+            const auto rejectReason = runtimeHintRejectReason(hint, visibleCuCount);
+            const bool acceptHint   = rejectReason == nullptr;
+            dumpRuntimeHintTrace("heuristic",
+                                 prob,
+                                 query,
+                                 &hint,
+                                 status,
+                                 acceptHint,
+                                 acceptHint ? "accepted" : rejectReason,
+                                 visibleCuCount);
+            if(acceptHint)
+            {
+                prob.uopc.valid               = 1;
+                prob.uopc.mode                = hint.mode;
+                prob.uopc.effectiveCuCount    = hint.effectiveCuUpperBound;
+                prob.uopc.effectiveCuBucket   = hint.effectiveCuBucket;
+                prob.uopc.commPressureLevel   = hint.commPressureLevel;
+                prob.uopc.overlapWindowType   = hint.overlapWindowType;
+                prob.uopc.topologyScope       = hint.topologyScope;
+                prob.uopc.source              = hint.source;
+                prob.uopc.relatedSeqNumber    = hint.relatedSeqNumber;
+
+                if(uopcDebugEnabled())
+                {
+                    std::fprintf(stderr,
+                                 "[hipblaslt][uopc] heuristic runtime hint source=%u bucket=%u upper=%u "
+                                 "pressure=%u seq=%llu stream=%llu\n",
+                                 static_cast<unsigned>(hint.source),
+                                 hint.effectiveCuBucket,
+                                 hint.effectiveCuUpperBound,
+                                 static_cast<unsigned>(hint.commPressureLevel),
+                                 static_cast<unsigned long long>(hint.relatedSeqNumber),
+                                 static_cast<unsigned long long>(query.streamUid));
+                }
+            }
+        }
+        else
+        {
+            recordRuntimeHintTelemetry(false, false);
+            dumpRuntimeHintTrace("heuristic",
+                                 prob,
+                                 query,
+                                 nullptr,
+                                 status,
+                                 false,
+                                 status == UOPC_STATUS_UNAVAILABLE ? "no_snapshot"
+                                                                   : "query_failed",
+                                 visibleCuCount);
+        }
+    }
+#else
+    inline void applyRuntimeUopcHint(rocblaslt_handle, RocblasltContractionProblem&)
+    {
+    }
+#endif
+
+    inline std::string normalizeOverrideArchName(const char* gcnArchName)
+    {
+        if(gcnArchName == nullptr)
+            return "";
+
+        std::string arch(gcnArchName);
+        const auto  pos = arch.find(':');
+        if(pos != std::string::npos)
+            arch.erase(pos);
+
+        return arch;
+    }
+
+    inline std::string getOverrideArchName(rocblaslt_handle handle)
+    {
+        return handle != nullptr ? normalizeOverrideArchName(handle->properties.gcnArchName) : "";
+    }
+
+    inline uint32_t getVisibleCuCount(rocblaslt_handle handle)
+    {
+        return handle != nullptr && handle->properties.multiProcessorCount > 0
+                   ? static_cast<uint32_t>(handle->properties.multiProcessorCount)
+                   : 0;
+    }
+
+    inline uint32_t getOverrideCuCount(rocblaslt_handle              handle,
+                                       const RocblasltContractionProblem& problem)
+    {
+        return (problem.uopc.valid && problem.uopc.effectiveCuCount > 0)
+                   ? problem.uopc.effectiveCuCount
+                   : getVisibleCuCount(handle);
+    }
+
+    inline void clearProblemUopcForRuntimeFallback(RocblasltContractionProblem& problem)
+    {
+        problem.uopc.valid               = 0;
+        problem.uopc.effectiveCuCount    = 0;
+        problem.uopc.effectiveCuBucket   = 0;
+        problem.uopc.commPressureLevel   = 0;
+        problem.uopc.overlapWindowType   = 0;
+        problem.uopc.topologyScope       = 0;
+        problem.uopc.relatedSeqNumber    = 0;
+    }
+
+    inline void setOverrideAlgoStoredEffectiveCuCount(rocblaslt_matmul_algo& algo,
+                                                      uint32_t               effectiveCuCount)
+    {
+        std::memcpy(algo.data + sizeof(uint32_t), &effectiveCuCount, sizeof(uint32_t));
+    }
+
+    inline TensileLite::ProblemOverride
+        makeOverrideLookupKey(const TensileLite::ProblemOverride& baseKey,
+                              const std::string&                 arch    = "",
+                              uint32_t                           cuCount = 0)
+    {
+        return TensileLite::ProblemOverride(baseKey.transA(),
+                                            baseKey.transB(),
+                                            baseKey.inputTypeA(),
+                                            baseKey.inputTypeB(),
+                                            baseKey.computeType(),
+                                            baseKey.outputType(),
+                                            baseKey.m(),
+                                            baseKey.n(),
+                                            baseKey.k(),
+                                            baseKey.batchSize(),
+                                            arch,
+                                            cuCount,
+                                            baseKey.biasVector(),
+                                            baseKey.biasType(),
+                                            baseKey.auxType(),
+                                            baseKey.activationType());
+    }
+
+    enum class OverrideLookupTier : uint8_t
+    {
+        none = 0,
+        exact,
+        arch_default,
+        legacy,
+    };
+
+    inline const char* toString(OverrideLookupTier tier)
+    {
+        switch(tier)
+        {
+        case OverrideLookupTier::none:
+            return "none";
+        case OverrideLookupTier::exact:
+            return "exact";
+        case OverrideLookupTier::arch_default:
+            return "arch_default";
+        case OverrideLookupTier::legacy:
+            return "legacy";
+        }
+
+        return "unknown";
+    }
+
+    struct CachedOverrideResult
+    {
+        bool                              initialized   = false;
+        bool                              success       = false;
+        int                               solutionIndex = -1;
+        uint32_t                          resolvedCuCount = 0;
+        OverrideLookupTier                tier          = OverrideLookupTier::none;
+        rocblaslt_matmul_heuristic_result result{};
+    };
+
+    class OverrideHeuristicCache
+    {
+    public:
+        static OverrideHeuristicCache& instance()
+        {
+            static OverrideHeuristicCache gInstance;
+            return gInstance;
+        }
+
+        bool lookup(const std::string& cacheKey, CachedOverrideResult& cached)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto                  it = m_cache.find(cacheKey);
+            if(it == m_cache.end())
+                return false;
+            cached = it->second;
+            return true;
+        }
+
+        void store(const std::string& cacheKey, const CachedOverrideResult& cached)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_cache[cacheKey] = cached;
+        }
+
+    private:
+        std::mutex                             m_mutex;
+        std::map<std::string, CachedOverrideResult> m_cache;
+    };
+
+    inline std::string makeOverrideCacheKey(const TensileLite::ProblemOverride& baseKey,
+                                            size_t                              maxWorkspaceBytes)
+    {
+        std::ostringstream os;
+        os << baseKey.arch() << '|'
+           << baseKey.cuCount() << '|'
+           << baseKey.transA() << '|'
+           << baseKey.transB() << '|'
+           << static_cast<int>(baseKey.inputTypeA()) << '|'
+           << static_cast<int>(baseKey.inputTypeB()) << '|'
+           << static_cast<int>(baseKey.computeType()) << '|'
+           << static_cast<int>(baseKey.outputType()) << '|'
+           << baseKey.m() << '|'
+           << baseKey.n() << '|'
+           << baseKey.k() << '|'
+           << baseKey.batchSize() << '|'
+           << baseKey.activationType() << '|'
+           << baseKey.biasVector() << '|'
+           << static_cast<int>(baseKey.biasType()) << '|'
+           << static_cast<int>(baseKey.auxType()) << '|'
+           << maxWorkspaceBytes;
+        return os.str();
+    }
+
+    inline std::string makeScopedOverrideCacheKey(const TensileLite::ProblemOverride& baseKey,
+                                                  size_t                              maxWorkspaceBytes)
+    {
+        return std::string("scoped|") + makeOverrideCacheKey(baseKey, maxWorkspaceBytes);
+    }
+
+    inline bool shouldUseScopedUopcExact(const RocblasltContractionProblem& problem)
+    {
+        return problem.uopc.valid && problem.uopc.source == kUopcHintSourceController
+               && problem.uopc.effectiveCuCount > 0;
+    }
+
+    enum class OverrideApiPath : uint8_t
+    {
+        c_api = 0,
+        cpp_api,
+    };
+
+    inline const char* toString(OverrideApiPath path)
+    {
+        switch(path)
+        {
+        case OverrideApiPath::c_api:
+            return "c";
+        case OverrideApiPath::cpp_api:
+            return "cpp";
+        }
+
+        return "unknown";
+    }
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+    inline void dumpOverrideTrace(OverrideApiPath                     path,
+                                  const char*                         reason,
+                                  const TensileLite::ProblemOverride& baseKey,
+                                  OverrideLookupTier                  tier,
+                                  uint32_t                            requestedCuCount,
+                                  uint32_t                            resolvedCuCount,
+                                  uint32_t                            visibleCuCount,
+                                  bool                                cacheHit,
+                                  bool                                success,
+                                  int                                 solutionIndex,
+                                  uint32_t                            hintSource,
+                                  uint32_t                            overlapWindowType,
+                                  uint64_t                            relatedSeqNumber)
+    {
+        if(!uopcDebugEnabled())
+            return;
+
+        std::fprintf(stderr,
+                     "[hipblaslt][uopc-trace] rank=%s local_rank=%s event=override path=%s "
+                     "success=%u cache_hit=%u reason=%s tier=%s requested_cu=%u resolved_cu=%u "
+                     "visible_cu=%u "
+                     "source=%u window=%u related_seq=%llu solution_index=%d m=%zu n=%zu k=%zu "
+                     "b=%zu act=%s bias=%d\n",
+                     overrideTelemetryRank(),
+                     overrideTelemetryLocalRank(),
+                     toString(path),
+                     success ? 1U : 0U,
+                     cacheHit ? 1U : 0U,
+                     reason != nullptr ? reason : "none",
+                     toString(tier),
+                     requestedCuCount,
+                     resolvedCuCount,
+                     visibleCuCount,
+                     hintSource,
+                     overlapWindowType,
+                     static_cast<unsigned long long>(relatedSeqNumber),
+                     solutionIndex,
+                     baseKey.m(),
+                     baseKey.n(),
+                     baseKey.k(),
+                     baseKey.batchSize(),
+                     baseKey.activationType().c_str(),
+                     baseKey.biasVector());
+    }
+#else
+    inline void dumpOverrideTrace(OverrideApiPath,
+                                  const char*,
+                                  const TensileLite::ProblemOverride&,
+                                  OverrideLookupTier,
+                                  uint32_t,
+                                  uint32_t,
+                                  uint32_t,
+                                  bool,
+                                  bool,
+                                  int,
+                                  uint32_t,
+                                  uint32_t,
+                                  uint64_t)
+    {
+    }
+#endif
+
+    struct OverrideLookupOutcome
+    {
+        OverrideLookupTier tier = OverrideLookupTier::none;
+        std::vector<int>   candidates{};
+        uint32_t           resolvedCuCount = 0;
+        size_t             exactCount       = 0;
+        size_t             archDefaultCount = 0;
+        size_t             legacyCount      = 0;
+    };
+
+    class OverrideTelemetry
+    {
+    public:
+        static OverrideTelemetry& instance()
+        {
+            static OverrideTelemetry gInstance;
+            return gInstance;
+        }
+
+        ~OverrideTelemetry()
+        {
+            dumpSummary("final");
+        }
+
+        void recordCacheLookup(OverrideApiPath                     path,
+                               const TensileLite::ProblemOverride& baseKey,
+                               const std::string&                 cacheKey,
+                               bool                               hit)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto&                       stats = touchStatsLocked(baseKey);
+            ++m_totalCalls;
+            ++stats.calls;
+            if(path == OverrideApiPath::c_api)
+                ++m_cApiCalls;
+            else
+                ++m_cppApiCalls;
+            m_uniqueCacheKeys.insert(cacheKey);
+            if(hit)
+            {
+                ++m_cacheHits;
+                ++stats.cacheHits;
+            }
+            else
+            {
+                ++m_cacheMisses;
+                ++stats.cacheMisses;
+            }
+            maybeDumpPeriodicLocked();
+        }
+
+        void recordLookupTier(const TensileLite::ProblemOverride& baseKey, OverrideLookupTier tier)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto&                       stats = touchStatsLocked(baseKey);
+            switch(tier)
+            {
+            case OverrideLookupTier::none:
+                ++m_noMatchLookups;
+                ++stats.noMatchLookups;
+                break;
+            case OverrideLookupTier::exact:
+                ++m_exactLookups;
+                ++stats.exactLookups;
+                break;
+            case OverrideLookupTier::arch_default:
+                ++m_archDefaultLookups;
+                ++stats.archDefaultLookups;
+                break;
+            case OverrideLookupTier::legacy:
+                ++m_legacyLookups;
+                ++stats.legacyLookups;
+                break;
+            }
+        }
+
+        void recordRuntimeHintOutcome(bool success, bool controllerSource)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if(success)
+            {
+                if(controllerSource)
+                    ++m_runtimeControllerHits;
+                else
+                    ++m_runtimeNonControllerHits;
+            }
+            else
+            {
+                ++m_runtimeNoSnapshot;
+            }
+        }
+
+        void recordRuntime304Fallback()
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            ++m_runtime304Fallbacks;
+        }
+
+        void recordCandidateAttempt(const TensileLite::ProblemOverride& baseKey,
+                                    int                                solutionIndex,
+                                    bool                               accepted)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto&                       stats = touchStatsLocked(baseKey);
+            ++m_candidateAttempts;
+            ++stats.candidateAttempts;
+            if(!accepted)
+            {
+                ++m_candidateRejects;
+                ++stats.candidateRejects;
+                if(solutionIndex >= 0)
+                    ++m_rejectedSolutionCounts[solutionIndex];
+            }
+        }
+
+        void recordFinalResult(const TensileLite::ProblemOverride& baseKey,
+                               OverrideLookupTier                 tier,
+                               bool                               success,
+                               int                                solutionIndex)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto&                       stats = touchStatsLocked(baseKey);
+            if(success)
+            {
+                ++m_successes;
+                ++stats.successes;
+                if(baseKey.cuCount() == 272 && tier == OverrideLookupTier::exact)
+                    ++m_exact272Selected;
+                if(baseKey.cuCount() == 304)
+                    ++m_fallback304Selected;
+                if(solutionIndex >= 0)
+                    ++m_selectedSolutionCounts[solutionIndex];
+            }
+            else
+            {
+                ++m_failures;
+                ++stats.failures;
+            }
+        }
+
+        void recordDurations(uint64_t totalNs, uint64_t preloadNs, uint64_t cacheProbeNs, uint64_t lookupNs)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_totalNs += totalNs;
+            m_preloadNs += preloadNs;
+            m_cacheProbeNs += cacheProbeNs;
+            m_lookupNs += lookupNs;
+        }
+
+    private:
+        struct KeyStats
+        {
+            uint64_t calls              = 0;
+            uint64_t cacheHits          = 0;
+            uint64_t cacheMisses        = 0;
+            uint64_t successes          = 0;
+            uint64_t failures           = 0;
+            uint64_t exactLookups       = 0;
+            uint64_t archDefaultLookups = 0;
+            uint64_t legacyLookups      = 0;
+            uint64_t noMatchLookups     = 0;
+            uint64_t candidateAttempts  = 0;
+            uint64_t candidateRejects   = 0;
+        };
+
+        std::string makeProblemKey(const TensileLite::ProblemOverride& baseKey) const
+        {
+            std::ostringstream os;
+            os << "arch=" << baseKey.arch() << "|cu=" << baseKey.cuCount() << "|ta="
+               << (baseKey.transA() ? 'T' : 'N') << "|tb=" << (baseKey.transB() ? 'T' : 'N')
+               << "|m=" << baseKey.m() << "|n=" << baseKey.n() << "|k=" << baseKey.k()
+               << "|b=" << baseKey.batchSize() << "|act=" << baseKey.activationType()
+               << "|bias=" << baseKey.biasVector();
+            return os.str();
+        }
+
+        KeyStats& touchStatsLocked(const TensileLite::ProblemOverride& baseKey)
+        {
+            const auto problemKey = makeProblemKey(baseKey);
+            m_uniqueProblemKeys.insert(problemKey);
+            return m_keyStats[problemKey];
+        }
+
+        template <typename Key, typename Value>
+        static std::vector<std::pair<Key, Value>>
+            sortCountsDescending(const std::map<Key, Value>& values, size_t limit)
+        {
+            std::vector<std::pair<Key, Value>> entries(values.begin(), values.end());
+            std::sort(entries.begin(),
+                      entries.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
+            if(entries.size() > limit)
+                entries.resize(limit);
+            return entries;
+        }
+
+        void maybeDumpPeriodicLocked()
+        {
+            const auto flushCalls = overrideTelemetryFlushCalls();
+            if(flushCalls == 0 || m_totalCalls == 0)
+                return;
+            if(m_nextFlushAt == 0)
+                m_nextFlushAt = flushCalls;
+            if(m_totalCalls < m_nextFlushAt)
+                return;
+
+            dumpSummaryLocked("periodic");
+            m_nextFlushAt += flushCalls;
+        }
+
+        void dumpSummary(const char* reason)
+        {
+            if(!overrideTelemetryEnabled())
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            dumpSummaryLocked(reason);
+        }
+
+        void dumpSummaryLocked(const char* reason)
+        {
+            if(m_totalCalls == 0)
+                return;
+
+            std::fprintf(stderr,
+                         "[hipblaslt][override-summary] rank=%s local_rank=%s reason=%s calls=%llu "
+                         "c_calls=%llu cpp_calls=%llu cache_hits=%llu cache_misses=%llu "
+                         "success=%llu failure=%llu exact=%llu arch_default=%llu legacy=%llu "
+                         "no_match=%llu candidate_attempts=%llu candidate_rejects=%llu "
+                         "unique_problem_keys=%zu unique_cache_keys=%zu\n",
+                         overrideTelemetryRank(),
+                         overrideTelemetryLocalRank(),
+                         reason,
+                         static_cast<unsigned long long>(m_totalCalls),
+                         static_cast<unsigned long long>(m_cApiCalls),
+                         static_cast<unsigned long long>(m_cppApiCalls),
+                         static_cast<unsigned long long>(m_cacheHits),
+                         static_cast<unsigned long long>(m_cacheMisses),
+                         static_cast<unsigned long long>(m_successes),
+                         static_cast<unsigned long long>(m_failures),
+                         static_cast<unsigned long long>(m_exactLookups),
+                         static_cast<unsigned long long>(m_archDefaultLookups),
+                         static_cast<unsigned long long>(m_legacyLookups),
+                         static_cast<unsigned long long>(m_noMatchLookups),
+                         static_cast<unsigned long long>(m_candidateAttempts),
+                         static_cast<unsigned long long>(m_candidateRejects),
+                         m_uniqueProblemKeys.size(),
+                         m_uniqueCacheKeys.size());
+
+            const auto callsAsDouble = static_cast<double>(m_totalCalls);
+            if(callsAsDouble > 0.0)
+            {
+                const auto avgTotalUs
+                    = static_cast<double>(m_totalNs) / (1000.0 * callsAsDouble);
+                const auto avgPreloadUs
+                    = static_cast<double>(m_preloadNs) / (1000.0 * callsAsDouble);
+                const auto avgCacheProbeUs
+                    = static_cast<double>(m_cacheProbeNs) / (1000.0 * callsAsDouble);
+                const auto avgLookupUs
+                    = static_cast<double>(m_lookupNs) / (1000.0 * callsAsDouble);
+                const auto avgOtherUs = avgTotalUs - avgPreloadUs - avgCacheProbeUs - avgLookupUs;
+                std::fprintf(stderr,
+                             "[hipblaslt][override-summary] rank=%s local_rank=%s reason=%s avg_total_us=%.3f "
+                             "avg_preload_us=%.3f avg_cache_probe_us=%.3f avg_lookup_us=%.3f "
+                             "avg_other_us=%.3f\n",
+                             overrideTelemetryRank(),
+                             overrideTelemetryLocalRank(),
+                             reason,
+                             avgTotalUs,
+                             avgPreloadUs,
+                             avgCacheProbeUs,
+                             avgLookupUs,
+                             avgOtherUs);
+            }
+
+            std::fprintf(stderr,
+                         "[hipblaslt][override-summary] rank=%s local_rank=%s reason=%s runtime_hint_controller_hit=%llu "
+                         "runtime_hint_other_hit=%llu runtime_hint_no_snapshot=%llu runtime304_fallbacks=%llu "
+                         "fallback_304_selected=%llu exact_272_selected=%llu\n",
+                         overrideTelemetryRank(),
+                         overrideTelemetryLocalRank(),
+                         reason,
+                         static_cast<unsigned long long>(m_runtimeControllerHits),
+                         static_cast<unsigned long long>(m_runtimeNonControllerHits),
+                         static_cast<unsigned long long>(m_runtimeNoSnapshot),
+                         static_cast<unsigned long long>(m_runtime304Fallbacks),
+                         static_cast<unsigned long long>(m_fallback304Selected),
+                         static_cast<unsigned long long>(m_exact272Selected));
+
+            for(const auto& [solutionIndex, count] : sortCountsDescending(m_selectedSolutionCounts, 12))
+            {
+                std::fprintf(stderr,
+                             "[hipblaslt][override-summary] rank=%s local_rank=%s selected_solution index=%d count=%llu\n",
+                             overrideTelemetryRank(),
+                             overrideTelemetryLocalRank(),
+                             solutionIndex,
+                             static_cast<unsigned long long>(count));
+            }
+
+            for(const auto& [solutionIndex, count] : sortCountsDescending(m_rejectedSolutionCounts, 12))
+            {
+                std::fprintf(stderr,
+                             "[hipblaslt][override-summary] rank=%s local_rank=%s rejected_solution index=%d count=%llu\n",
+                             overrideTelemetryRank(),
+                             overrideTelemetryLocalRank(),
+                             solutionIndex,
+                             static_cast<unsigned long long>(count));
+            }
+
+            std::vector<std::pair<std::string, KeyStats>> keyEntries(m_keyStats.begin(), m_keyStats.end());
+            std::sort(keyEntries.begin(),
+                      keyEntries.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.second.calls > rhs.second.calls; });
+            if(keyEntries.size() > 12)
+                keyEntries.resize(12);
+
+            for(const auto& [key, stats] : keyEntries)
+            {
+                std::fprintf(stderr,
+                             "[hipblaslt][override-summary] rank=%s local_rank=%s key=%s calls=%llu cache_hits=%llu "
+                             "cache_misses=%llu success=%llu failure=%llu exact=%llu "
+                             "arch_default=%llu legacy=%llu no_match=%llu candidate_attempts=%llu "
+                             "candidate_rejects=%llu\n",
+                             overrideTelemetryRank(),
+                             overrideTelemetryLocalRank(),
+                             key.c_str(),
+                             static_cast<unsigned long long>(stats.calls),
+                             static_cast<unsigned long long>(stats.cacheHits),
+                             static_cast<unsigned long long>(stats.cacheMisses),
+                             static_cast<unsigned long long>(stats.successes),
+                             static_cast<unsigned long long>(stats.failures),
+                             static_cast<unsigned long long>(stats.exactLookups),
+                             static_cast<unsigned long long>(stats.archDefaultLookups),
+                             static_cast<unsigned long long>(stats.legacyLookups),
+                             static_cast<unsigned long long>(stats.noMatchLookups),
+                             static_cast<unsigned long long>(stats.candidateAttempts),
+                             static_cast<unsigned long long>(stats.candidateRejects));
+            }
+        }
+
+        std::mutex                     m_mutex;
+        uint64_t                       m_totalCalls         = 0;
+        uint64_t                       m_cApiCalls          = 0;
+        uint64_t                       m_cppApiCalls        = 0;
+        uint64_t                       m_cacheHits          = 0;
+        uint64_t                       m_cacheMisses        = 0;
+        uint64_t                       m_successes          = 0;
+        uint64_t                       m_failures           = 0;
+        uint64_t                       m_exactLookups       = 0;
+        uint64_t                       m_archDefaultLookups = 0;
+        uint64_t                       m_legacyLookups      = 0;
+        uint64_t                       m_noMatchLookups     = 0;
+        uint64_t                       m_candidateAttempts  = 0;
+        uint64_t                       m_candidateRejects   = 0;
+        uint64_t                       m_totalNs            = 0;
+        uint64_t                       m_preloadNs          = 0;
+        uint64_t                       m_cacheProbeNs       = 0;
+        uint64_t                       m_lookupNs           = 0;
+        uint64_t                       m_nextFlushAt        = 0;
+        uint64_t                       m_runtimeControllerHits   = 0;
+        uint64_t                       m_runtimeNonControllerHits = 0;
+        uint64_t                       m_runtimeNoSnapshot       = 0;
+        uint64_t                       m_runtime304Fallbacks     = 0;
+        uint64_t                       m_fallback304Selected     = 0;
+        uint64_t                       m_exact272Selected        = 0;
+        std::set<std::string>          m_uniqueProblemKeys;
+        std::set<std::string>          m_uniqueCacheKeys;
+        std::map<int, uint64_t>        m_selectedSolutionCounts;
+        std::map<int, uint64_t>        m_rejectedSolutionCounts;
+        std::map<std::string, KeyStats> m_keyStats;
+    };
+
+    inline void recordRuntimeHintTelemetry(bool success, bool controllerSource)
+    {
+        OverrideTelemetry::instance().recordRuntimeHintOutcome(success, controllerSource);
+    }
+
+    inline OverrideLookupOutcome
+        lookupOverrideSolutions(TensileLite::OverrideMap&          overrideMap,
+                                const TensileLite::ProblemOverride& baseKey,
+                                const std::string&                 archName,
+                                uint32_t                           cuCount)
+    {
+        OverrideLookupOutcome outcome;
+        auto exactSolutions    = overrideMap.lookup(makeOverrideLookupKey(baseKey, archName, cuCount));
+        auto archDefault       = overrideMap.lookup(makeOverrideLookupKey(baseKey, archName, 0));
+        auto legacySolutions   = overrideMap.lookup(makeOverrideLookupKey(baseKey));
+        outcome.exactCount       = exactSolutions.size();
+        outcome.archDefaultCount = archDefault.size();
+        outcome.legacyCount      = legacySolutions.size();
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+        if(uopcDebugEnabled())
+        {
+            std::fprintf(stderr,
+                         "[hipblaslt][uopc] override lookup arch=%s cu=%u m=%zu n=%zu k=%zu b=%zu "
+                         "act=%s bias=%d exact=%zu arch_default=%zu legacy=%zu\n",
+                         archName.c_str(),
+                         cuCount,
+                         baseKey.m(),
+                         baseKey.n(),
+                         baseKey.k(),
+                         baseKey.batchSize(),
+                         baseKey.activationType().c_str(),
+                         baseKey.biasVector(),
+                         outcome.exactCount,
+                         outcome.archDefaultCount,
+                         outcome.legacyCount);
+        }
+#endif
+
+        if(!exactSolutions.empty())
+        {
+            outcome.tier            = OverrideLookupTier::exact;
+            outcome.candidates      = std::move(exactSolutions);
+            outcome.resolvedCuCount = cuCount;
+            return outcome;
+        }
+        if(!archDefault.empty())
+        {
+            outcome.tier            = OverrideLookupTier::arch_default;
+            outcome.candidates      = std::move(archDefault);
+            outcome.resolvedCuCount = 0;
+            return outcome;
+        }
+        if(!legacySolutions.empty())
+        {
+            outcome.tier            = OverrideLookupTier::legacy;
+            outcome.candidates      = std::move(legacySolutions);
+            outcome.resolvedCuCount = 0;
+            return outcome;
+        }
+        return outcome;
+    }
+
+    inline OverrideLookupOutcome
+        lookupScopedExactOverrideSolutions(TensileLite::OverrideMap&          overrideMap,
+                                           const TensileLite::ProblemOverride& baseKey,
+                                           const std::string&                 archName,
+                                           uint32_t                           cuCount)
+    {
+        OverrideLookupOutcome outcome;
+        auto                  exactSolutions
+            = overrideMap.lookup(makeOverrideLookupKey(baseKey, archName, cuCount));
+        outcome.exactCount = exactSolutions.size();
+
+#ifdef HIPBLASLT_ENABLE_UOPC
+        if(uopcDebugEnabled())
+        {
+            std::fprintf(stderr,
+                         "[hipblaslt][uopc] scoped exact lookup arch=%s cu=%u m=%zu n=%zu k=%zu b=%zu "
+                         "act=%s bias=%d exact=%zu\n",
+                         archName.c_str(),
+                         cuCount,
+                         baseKey.m(),
+                         baseKey.n(),
+                         baseKey.k(),
+                         baseKey.batchSize(),
+                         baseKey.activationType().c_str(),
+                         baseKey.biasVector(),
+                         outcome.exactCount);
+        }
+#endif
+
+        if(!exactSolutions.empty())
+        {
+            outcome.tier            = OverrideLookupTier::exact;
+            outcome.candidates      = std::move(exactSolutions);
+            outcome.resolvedCuCount = cuCount;
+        }
+        return outcome;
+    }
+} // namespace
 
 inline void assignAlphaBeta1(const rocblaslt_compute_type& compute_type, void* alpha, void* beta)
 {
@@ -121,6 +1137,413 @@ inline bool
     return (index == -1) ? false : true;
 }
 
+bool problem_scoped_override_from_file(rocblaslt_handle&                 handle,
+                                       RocblasltContractionProblem&      problem,
+                                       rocblaslt_matmul_desc&            matmul_desc,
+                                       rocblaslt_matmul_heuristic_result heuristicResultsArray[],
+                                       const std::string&                file_path,
+                                       size_t                            max_workspace_bytes)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto callStart = Clock::now();
+    if(!shouldUseScopedUopcExact(problem))
+        return false;
+
+    bool success = false;
+    const auto preloadStart = Clock::now();
+    TensileLite::getContractionProblemsFromFile(file_path);
+    const auto preloadEnd = Clock::now();
+    TensileLite::OverrideMap& m_override = TensileLite::OverrideMap::getMap();
+
+    if(m_override.size() == 0)
+    {
+        log_info(__func__, "No valid entries found in scoped override file.");
+        return false;
+    }
+
+    std::vector<rocblaslt_matmul_heuristic_result> overrideResults;
+    std::vector<int>                               solutionIndex(1);
+    const auto                                     baseKey
+        = RocblasltContractionProblem2ProblemOverride(problem);
+    const auto archName          = getOverrideArchName(handle);
+    const auto requestedCuCount  = getOverrideCuCount(handle, problem);
+    const auto visibleCuCount    = getVisibleCuCount(handle);
+    const auto hintSource        = static_cast<uint32_t>(problem.uopc.source);
+    const auto overlapWindowType = static_cast<uint32_t>(problem.uopc.overlapWindowType);
+    const auto relatedSeqNumber  = static_cast<uint64_t>(problem.uopc.relatedSeqNumber);
+    if(requestedCuCount == 0)
+        return false;
+
+    const auto requestedKey = makeOverrideLookupKey(baseKey, archName, requestedCuCount);
+    const auto cacheKey     = makeScopedOverrideCacheKey(requestedKey, max_workspace_bytes);
+    CachedOverrideResult cachedResult;
+    const auto         cacheProbeStart = Clock::now();
+    const bool cacheHit = OverrideHeuristicCache::instance().lookup(cacheKey, cachedResult);
+    const auto cacheProbeEnd = Clock::now();
+    OverrideTelemetry::instance().recordCacheLookup(
+        OverrideApiPath::c_api, requestedKey, cacheKey, cacheHit);
+    if(cacheHit)
+    {
+        OverrideTelemetry::instance().recordLookupTier(requestedKey, cachedResult.tier);
+        OverrideTelemetry::instance().recordFinalResult(
+            requestedKey,
+            cachedResult.tier,
+            cachedResult.success,
+            cachedResult.success ? cachedResult.solutionIndex : -1);
+        OverrideTelemetry::instance().recordDurations(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd
+                                                                     - cacheProbeStart)
+                    .count()),
+            0);
+        if(cachedResult.success)
+        {
+            heuristicResult_copy(&heuristicResultsArray[0],
+                                 &cachedResult.result,
+                                 max_workspace_bytes,
+                                 cachedResult.result.workspaceSize);
+            if(cachedResult.resolvedCuCount > 0)
+                setOverrideAlgoStoredEffectiveCuCount(heuristicResultsArray[0].algo,
+                                                      cachedResult.resolvedCuCount);
+        }
+        dumpOverrideTrace(OverrideApiPath::c_api,
+                          cachedResult.success ? "scoped_exact_cache_success"
+                                               : "scoped_exact_cache_failure",
+                          requestedKey,
+                          cachedResult.tier,
+                          requestedCuCount,
+                          cachedResult.resolvedCuCount > 0 ? cachedResult.resolvedCuCount
+                                                           : requestedCuCount,
+                          visibleCuCount,
+                          true,
+                          cachedResult.success,
+                          cachedResult.success ? cachedResult.solutionIndex : -1,
+                          hintSource,
+                          overlapWindowType,
+                          relatedSeqNumber);
+        return cachedResult.success;
+    }
+
+    const auto lookupStart   = Clock::now();
+    const auto lookupOutcome = lookupScopedExactOverrideSolutions(
+        m_override, baseKey, archName, requestedCuCount);
+    const auto lookupEnd = Clock::now();
+    const auto telemetryKey = makeOverrideLookupKey(baseKey, archName, requestedCuCount);
+    OverrideTelemetry::instance().recordLookupTier(telemetryKey, lookupOutcome.tier);
+
+    for(auto candidateIdx : lookupOutcome.candidates)
+    {
+        solutionIndex[0] = candidateIdx;
+        overrideResults.clear();
+        bool candidateAccepted = false;
+
+        if(rocblaslt_status_success
+           == getSolutionsFromIndex(
+               handle, solutionIndex, overrideResults, max_workspace_bytes))
+        {
+            size_t required_workspace_size = 0;
+            auto&  tensile_data            = matmul_desc->m_data;
+
+            if(rocblaslt_status_success
+               == isSolutionSupported(handle,
+                                      problem,
+                                      tensile_data,
+                                      &overrideResults[0].algo,
+                                      &required_workspace_size))
+            {
+                success = true;
+            }
+            else if(problem.compute_type == rocblaslt_compute_f32_fast_xf32)
+            {
+                problem.compute_type = rocblaslt_compute_f32;
+                if(rocblaslt_status_success
+                   == isSolutionSupported(handle,
+                                          problem,
+                                          tensile_data,
+                                          &overrideResults[0].algo,
+                                          &required_workspace_size))
+                {
+                    success = true;
+                    log_info(__func__, "Use the fallback fp32 solution");
+                }
+                problem.compute_type = rocblaslt_compute_f32_fast_xf32;
+            }
+
+            if(success)
+            {
+                candidateAccepted = true;
+                heuristicResult_copy(&heuristicResultsArray[0],
+                                     &overrideResults[0],
+                                     max_workspace_bytes,
+                                     required_workspace_size);
+                setOverrideAlgoStoredEffectiveCuCount(
+                    heuristicResultsArray[0].algo, requestedCuCount);
+                CachedOverrideResult cachedSuccess;
+                cachedSuccess.initialized     = true;
+                cachedSuccess.success         = true;
+                cachedSuccess.solutionIndex   = solutionIndex[0];
+                cachedSuccess.resolvedCuCount = requestedCuCount;
+                cachedSuccess.tier            = lookupOutcome.tier;
+                cachedSuccess.result          = heuristicResultsArray[0];
+                OverrideHeuristicCache::instance().store(cacheKey, cachedSuccess);
+            }
+        }
+
+        OverrideTelemetry::instance().recordCandidateAttempt(
+            telemetryKey, solutionIndex[0], candidateAccepted);
+        if(candidateAccepted)
+            break;
+    }
+
+    if(!success)
+    {
+        CachedOverrideResult cachedFailure;
+        cachedFailure.initialized     = true;
+        cachedFailure.success         = false;
+        cachedFailure.resolvedCuCount = requestedCuCount;
+        cachedFailure.tier            = lookupOutcome.tier;
+        OverrideHeuristicCache::instance().store(cacheKey, cachedFailure);
+    }
+    else
+    {
+        std::string mapping_result = "Find scoped exact solution with index: ";
+        mapping_result += std::to_string(solutionIndex[0]);
+        log_info(__func__, mapping_result);
+    }
+
+    dumpOverrideTrace(OverrideApiPath::c_api,
+                      success ? "scoped_exact_selected" : "scoped_exact_no_match",
+                      telemetryKey,
+                      lookupOutcome.tier,
+                      requestedCuCount,
+                      requestedCuCount,
+                      visibleCuCount,
+                      false,
+                      success,
+                      success ? solutionIndex[0] : -1,
+                      hintSource,
+                      overlapWindowType,
+                      relatedSeqNumber);
+    OverrideTelemetry::instance().recordFinalResult(
+        telemetryKey, lookupOutcome.tier, success, success ? solutionIndex[0] : -1);
+    OverrideTelemetry::instance().recordDurations(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd - cacheProbeStart)
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(lookupEnd - lookupStart)
+                .count()));
+    return success;
+}
+
+bool problem_scoped_override_from_file_cpp(
+    rocblaslt_handle&                               handle,
+    rocblaslt::RocGemmType&                         gemmType,
+    std::shared_ptr<void>                           gemmData,
+    std::vector<rocblaslt_matmul_heuristic_result>& heuristicResultsArray,
+    const std::string&                              file_path,
+    size_t                                          max_workspace_bytes)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto callStart = Clock::now();
+    if(gemmType != rocblaslt::RocGemmType::ROCBLASLT_GEMM)
+        return false;
+
+    const auto overrideCuCount = TensileDataGemmEffectiveCuCount(gemmData);
+    if(overrideCuCount == 0)
+        return false;
+
+    bool success = false;
+    const auto preloadStart = Clock::now();
+    TensileLite::getContractionProblemsFromFile(file_path);
+    const auto preloadEnd = Clock::now();
+    TensileLite::OverrideMap& m_override = TensileLite::OverrideMap::getMap();
+    if(m_override.size() == 0)
+    {
+        log_info(__func__, "No valid entries found in scoped override file.");
+        return false;
+    }
+
+    std::vector<rocblaslt_matmul_heuristic_result> overrideResults;
+    std::vector<int>                               solutionIndex(1);
+    const auto resolvedCuCount = overrideCuCount;
+    const auto baseKey
+        = TensileDataGemm2ProblemOverride(gemmData, getOverrideArchName(handle), resolvedCuCount);
+    const auto cacheKey = makeScopedOverrideCacheKey(baseKey, max_workspace_bytes);
+    CachedOverrideResult cachedResult;
+    const auto         cacheProbeStart = Clock::now();
+    const bool cacheHit = OverrideHeuristicCache::instance().lookup(cacheKey, cachedResult);
+    const auto cacheProbeEnd = Clock::now();
+    OverrideTelemetry::instance().recordCacheLookup(
+        OverrideApiPath::cpp_api, baseKey, cacheKey, cacheHit);
+    if(cacheHit)
+    {
+        OverrideTelemetry::instance().recordLookupTier(baseKey, cachedResult.tier);
+        OverrideTelemetry::instance().recordFinalResult(
+            baseKey,
+            cachedResult.tier,
+            cachedResult.success,
+            cachedResult.success ? cachedResult.solutionIndex : -1);
+        OverrideTelemetry::instance().recordDurations(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd
+                                                                     - cacheProbeStart)
+                    .count()),
+            0);
+        if(cachedResult.success)
+            heuristicResultsArray.push_back(cachedResult.result);
+        dumpOverrideTrace(OverrideApiPath::cpp_api,
+                          cachedResult.success ? "scoped_exact_cache_success"
+                                               : "scoped_exact_cache_failure",
+                          baseKey,
+                          cachedResult.tier,
+                          resolvedCuCount,
+                          cachedResult.resolvedCuCount > 0 ? cachedResult.resolvedCuCount
+                                                           : resolvedCuCount,
+                          0U,
+                          true,
+                          cachedResult.success,
+                          cachedResult.success ? cachedResult.solutionIndex : -1,
+                          0U,
+                          0U,
+                          0ULL);
+        return cachedResult.success;
+    }
+
+    const auto lookupStart   = Clock::now();
+    const auto lookupOutcome = lookupScopedExactOverrideSolutions(
+        m_override, baseKey, getOverrideArchName(handle), resolvedCuCount);
+    const auto lookupEnd = Clock::now();
+    OverrideTelemetry::instance().recordLookupTier(baseKey, lookupOutcome.tier);
+
+    for(auto candidateIdx : lookupOutcome.candidates)
+    {
+        solutionIndex[0] = candidateIdx;
+        overrideResults.clear();
+        bool candidateAccepted = false;
+        if(rocblaslt_status_success
+           == getSolutionsFromIndex(
+               handle, solutionIndex, overrideResults, max_workspace_bytes))
+        {
+            size_t                  required_workspace_size = 0;
+            rocblaslt::RocTuningV2* tuning                  = nullptr;
+            if(rocblaslt_status_success
+               == isSolutionSupported(handle,
+                                      static_cast<const rocblaslt::RocGemmType>(gemmType),
+                                      gemmData,
+                                      overrideResults[0].algo,
+                                      tuning,
+                                      required_workspace_size))
+            {
+                success = true;
+            }
+            else
+            {
+                auto problem = ExtractProblemGemm(gemmData);
+                if(problem->f32XdlMathOp() == rocisa::DataType::XFloat32)
+                {
+                    problem->setF32XdlMathOp(rocisa::DataType::Float);
+                    if(rocblaslt_status_success
+                       == isSolutionSupported(handle,
+                                              static_cast<const rocblaslt::RocGemmType>(gemmType),
+                                              gemmData,
+                                              overrideResults[0].algo,
+                                              tuning,
+                                              required_workspace_size))
+                    {
+                        success = true;
+                        log_info(__func__, "Use the fallback fp32 solution");
+                    }
+                }
+            }
+
+            if(success)
+            {
+                candidateAccepted = true;
+                overrideResults[0].workspaceSize = required_workspace_size;
+                heuristicResultsArray.push_back(overrideResults[0]);
+                CachedOverrideResult cachedSuccess;
+                cachedSuccess.initialized     = true;
+                cachedSuccess.success         = true;
+                cachedSuccess.solutionIndex   = solutionIndex[0];
+                cachedSuccess.resolvedCuCount = resolvedCuCount;
+                cachedSuccess.tier            = lookupOutcome.tier;
+                cachedSuccess.result          = overrideResults[0];
+                OverrideHeuristicCache::instance().store(cacheKey, cachedSuccess);
+            }
+        }
+
+        OverrideTelemetry::instance().recordCandidateAttempt(
+            baseKey, solutionIndex[0], candidateAccepted);
+        if(candidateAccepted)
+            break;
+    }
+
+    if(!success)
+    {
+        CachedOverrideResult cachedFailure;
+        cachedFailure.initialized     = true;
+        cachedFailure.success         = false;
+        cachedFailure.resolvedCuCount = resolvedCuCount;
+        cachedFailure.tier            = lookupOutcome.tier;
+        OverrideHeuristicCache::instance().store(cacheKey, cachedFailure);
+    }
+    else
+    {
+        std::string mapping_result = "Find scoped exact solution with index: ";
+        mapping_result += std::to_string(solutionIndex[0]);
+        log_info(__func__, mapping_result);
+    }
+
+    dumpOverrideTrace(OverrideApiPath::cpp_api,
+                      success ? "scoped_exact_selected" : "scoped_exact_no_match",
+                      baseKey,
+                      lookupOutcome.tier,
+                      resolvedCuCount,
+                      resolvedCuCount,
+                      0U,
+                      false,
+                      success,
+                      success ? solutionIndex[0] : -1,
+                      0U,
+                      0U,
+                      0ULL);
+    OverrideTelemetry::instance().recordFinalResult(
+        baseKey, lookupOutcome.tier, success, success ? solutionIndex[0] : -1);
+    OverrideTelemetry::instance().recordDurations(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd - cacheProbeStart)
+                .count()),
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(lookupEnd - lookupStart)
+                .count()));
+    return success;
+}
+
 // Preload problem/solution mappings
 bool problem_override_from_file(rocblaslt_handle&                 handle,
                                 RocblasltContractionProblem&      problem,
@@ -129,9 +1552,12 @@ bool problem_override_from_file(rocblaslt_handle&                 handle,
                                 const std::string&                file_path,
                                 size_t                            max_workspace_bytes)
 {
-
+    using Clock = std::chrono::steady_clock;
+    const auto callStart = Clock::now();
     bool success = false;
+    const auto preloadStart = Clock::now();
     TensileLite::getContractionProblemsFromFile(file_path);
+    const auto preloadEnd = Clock::now();
     TensileLite::OverrideMap& m_override = TensileLite::OverrideMap::getMap();
 
     if(m_override.size() == 0)
@@ -142,12 +1568,100 @@ bool problem_override_from_file(rocblaslt_handle&                 handle,
     {
         std::vector<rocblaslt_matmul_heuristic_result> overrideResults;
         std::vector<int>                               solutionIndex(1);
-        TensileLite::ProblemOverride prob_key(RocblasltContractionProblem2ProblemOverride(problem));
-        auto                         sol_iter = m_override.find(prob_key);
-
-        for(auto sol_idx = sol_iter.first; !success && sol_idx != sol_iter.second; sol_idx++)
+        const auto                                     baseKey
+            = RocblasltContractionProblem2ProblemOverride(problem);
+        const auto archName          = getOverrideArchName(handle);
+        const auto requestedCuCount  = getOverrideCuCount(handle, problem);
+        const auto visibleCuCount    = getVisibleCuCount(handle);
+        const auto hintSource
+            = problem.uopc.valid ? static_cast<uint32_t>(problem.uopc.source) : 0U;
+        const auto overlapWindowType
+            = problem.uopc.valid ? static_cast<uint32_t>(problem.uopc.overlapWindowType) : 0U;
+        const auto relatedSeqNumber
+            = problem.uopc.valid ? static_cast<uint64_t>(problem.uopc.relatedSeqNumber) : 0ULL;
+        const bool allow304Fallback
+            = problem.uopc.valid && problem.uopc.source != kUopcHintSourcePreference
+              && requestedCuCount > 0 && visibleCuCount > 0 && requestedCuCount != visibleCuCount;
+        const auto requestedKey
+            = makeOverrideLookupKey(baseKey, archName, requestedCuCount);
+        const auto cacheKey = makeOverrideCacheKey(requestedKey, max_workspace_bytes);
+        CachedOverrideResult cachedResult;
+        const auto         cacheProbeStart = Clock::now();
+        const bool cacheHit = OverrideHeuristicCache::instance().lookup(cacheKey, cachedResult);
+        const auto cacheProbeEnd = Clock::now();
+        OverrideTelemetry::instance().recordCacheLookup(
+            OverrideApiPath::c_api, requestedKey, cacheKey, cacheHit);
+        if(cacheHit)
         {
-            solutionIndex[0] = sol_idx->second;
+            const auto cachedCuCount
+                = cachedResult.resolvedCuCount > 0 ? cachedResult.resolvedCuCount : requestedCuCount;
+            const auto cachedKey = makeOverrideLookupKey(baseKey, archName, cachedCuCount);
+            OverrideTelemetry::instance().recordLookupTier(cachedKey, cachedResult.tier);
+            OverrideTelemetry::instance().recordFinalResult(
+                cachedKey,
+                cachedResult.tier,
+                cachedResult.success,
+                cachedResult.success ? cachedResult.solutionIndex : -1);
+            OverrideTelemetry::instance().recordDurations(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                        .count()),
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                        .count()),
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd
+                                                                         - cacheProbeStart)
+                        .count()),
+                0);
+            if(cachedResult.success)
+            {
+                heuristicResult_copy(&heuristicResultsArray[0],
+                                     &cachedResult.result,
+                                     max_workspace_bytes,
+                                     cachedResult.result.workspaceSize);
+                if(cachedResult.resolvedCuCount > 0)
+                    setOverrideAlgoStoredEffectiveCuCount(heuristicResultsArray[0].algo,
+                                                          cachedResult.resolvedCuCount);
+            }
+            else if(allow304Fallback)
+            {
+                clearProblemUopcForRuntimeFallback(problem);
+                OverrideTelemetry::instance().recordRuntime304Fallback();
+            }
+            dumpOverrideTrace(OverrideApiPath::c_api,
+                              cachedResult.success ? "cache_success"
+                                                   : (allow304Fallback ? "runtime304_fallback_cache"
+                                                                       : "cache_failure"),
+                              cachedKey,
+                              cachedResult.tier,
+                              requestedCuCount,
+                              cachedResult.success
+                                  ? cachedCuCount
+                                  : (allow304Fallback ? visibleCuCount : cachedCuCount),
+                              visibleCuCount,
+                              true,
+                              cachedResult.success,
+                              cachedResult.success ? cachedResult.solutionIndex : -1,
+                              hintSource,
+                              overlapWindowType,
+                              relatedSeqNumber);
+            return cachedResult.success;
+        }
+        const auto lookupStart = Clock::now();
+        const auto lookupOutcome = lookupOverrideSolutions(
+            m_override, baseKey, archName, requestedCuCount);
+        const auto lookupEnd = Clock::now();
+        const auto selectedCuCount
+            = lookupOutcome.resolvedCuCount > 0 ? lookupOutcome.resolvedCuCount : requestedCuCount;
+        const auto telemetryKey = makeOverrideLookupKey(baseKey, archName, selectedCuCount);
+        OverrideTelemetry::instance().recordLookupTier(telemetryKey, lookupOutcome.tier);
+
+        for(auto candidateIdx : lookupOutcome.candidates)
+        {
+            solutionIndex[0] = candidateIdx;
+            overrideResults.clear();
+            bool candidateAccepted = false;
 
             if(rocblaslt_status_success
                == getSolutionsFromIndex(
@@ -188,18 +1702,46 @@ bool problem_override_from_file(rocblaslt_handle&                 handle,
 
                 if(success)
                 {
+                    candidateAccepted = true;
 
                     heuristicResult_copy(&heuristicResultsArray[0],
                                          &overrideResults[0],
                                          max_workspace_bytes,
                                          required_workspace_size);
+                    if(selectedCuCount > 0)
+                        setOverrideAlgoStoredEffectiveCuCount(heuristicResultsArray[0].algo,
+                                                              selectedCuCount);
+                    CachedOverrideResult cachedSuccess;
+                    cachedSuccess.initialized    = true;
+                    cachedSuccess.success        = true;
+                    cachedSuccess.solutionIndex  = solutionIndex[0];
+                    cachedSuccess.resolvedCuCount = selectedCuCount;
+                    cachedSuccess.tier           = lookupOutcome.tier;
+                    cachedSuccess.result         = heuristicResultsArray[0];
+                    OverrideHeuristicCache::instance().store(cacheKey, cachedSuccess);
                 }
             }
+
+            OverrideTelemetry::instance().recordCandidateAttempt(
+                telemetryKey, solutionIndex[0], candidateAccepted);
+            if(candidateAccepted)
+                break;
         }
 
         if(!success)
         {
+            CachedOverrideResult cachedFailure;
+            cachedFailure.initialized    = true;
+            cachedFailure.success        = false;
+            cachedFailure.resolvedCuCount = selectedCuCount;
+            cachedFailure.tier           = lookupOutcome.tier;
+            OverrideHeuristicCache::instance().store(cacheKey, cachedFailure);
             log_info(__func__, "No valid solution index found in override file.");
+            if(allow304Fallback)
+            {
+                clearProblemUopcForRuntimeFallback(problem);
+                OverrideTelemetry::instance().recordRuntime304Fallback();
+            }
         }
         else
         {
@@ -207,6 +1749,38 @@ bool problem_override_from_file(rocblaslt_handle&                 handle,
             mapping_result += std::to_string(solutionIndex[0]);
             log_info(__func__, mapping_result);
         }
+        dumpOverrideTrace(OverrideApiPath::c_api,
+                          success ? "selected"
+                                  : (allow304Fallback ? "runtime304_fallback_no_match"
+                                                      : "no_valid_solution"),
+                          telemetryKey,
+                          lookupOutcome.tier,
+                          requestedCuCount,
+                          success ? selectedCuCount
+                                  : (allow304Fallback ? visibleCuCount : selectedCuCount),
+                          visibleCuCount,
+                          false,
+                          success,
+                          success ? solutionIndex[0] : -1,
+                          hintSource,
+                          overlapWindowType,
+                          relatedSeqNumber);
+        OverrideTelemetry::instance().recordFinalResult(
+            telemetryKey, lookupOutcome.tier, success, success ? solutionIndex[0] : -1);
+        OverrideTelemetry::instance().recordDurations(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd
+                                                                     - cacheProbeStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(lookupEnd - lookupStart)
+                    .count()));
     }
 
     return success;
@@ -220,9 +1794,18 @@ bool problem_override_from_file_cpp(
     const std::string&                              file_path,
     size_t                                          max_workspace_bytes)
 {
-
+    using Clock = std::chrono::steady_clock;
+    const auto callStart = Clock::now();
     bool success = false;
+    if(gemmType != rocblaslt::RocGemmType::ROCBLASLT_GEMM)
+    {
+        log_info(__func__, "Skip override file lookup for non-GEMM problem type.");
+        return false;
+    }
+
+    const auto preloadStart = Clock::now();
     TensileLite::getContractionProblemsFromFile(file_path);
+    const auto preloadEnd = Clock::now();
     TensileLite::OverrideMap& m_override = TensileLite::OverrideMap::getMap();
 
     if(m_override.size() == 0)
@@ -233,12 +1816,68 @@ bool problem_override_from_file_cpp(
     {
         std::vector<rocblaslt_matmul_heuristic_result> overrideResults;
         std::vector<int>                               solutionIndex(1);
-        TensileLite::ProblemOverride prob_key(TensileDataGemm2ProblemOverride(gemmData));
-        auto                         sol_iter = m_override.find(prob_key);
-
-        for(auto sol_idx = sol_iter.first; !success && sol_idx != sol_iter.second; sol_idx++)
+        const auto overrideCuCount = TensileDataGemmEffectiveCuCount(gemmData);
+        const auto resolvedCuCount = overrideCuCount > 0 ? overrideCuCount : getVisibleCuCount(handle);
+        const auto baseKey
+            = TensileDataGemm2ProblemOverride(gemmData, getOverrideArchName(handle), resolvedCuCount);
+        const auto         cacheKey = makeOverrideCacheKey(baseKey, max_workspace_bytes);
+        CachedOverrideResult cachedResult;
+        const auto         cacheProbeStart = Clock::now();
+        const bool cacheHit = OverrideHeuristicCache::instance().lookup(cacheKey, cachedResult);
+        const auto cacheProbeEnd = Clock::now();
+        OverrideTelemetry::instance().recordCacheLookup(
+            OverrideApiPath::cpp_api, baseKey, cacheKey, cacheHit);
+        if(cacheHit)
         {
-            solutionIndex[0] = sol_idx->second;
+            OverrideTelemetry::instance().recordLookupTier(baseKey, cachedResult.tier);
+            OverrideTelemetry::instance().recordFinalResult(
+                baseKey,
+                cachedResult.tier,
+                cachedResult.success,
+                cachedResult.success ? cachedResult.solutionIndex : -1);
+            OverrideTelemetry::instance().recordDurations(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                        .count()),
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                        .count()),
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd
+                                                                         - cacheProbeStart)
+                        .count()),
+                0);
+            if(cachedResult.success)
+            {
+                heuristicResultsArray.push_back(cachedResult.result);
+            }
+            dumpOverrideTrace(OverrideApiPath::cpp_api,
+                              cachedResult.success ? "cache_success" : "cache_failure",
+                              baseKey,
+                              cachedResult.tier,
+                              resolvedCuCount,
+                              cachedResult.resolvedCuCount > 0 ? cachedResult.resolvedCuCount
+                                                               : resolvedCuCount,
+                              0U,
+                              true,
+                              cachedResult.success,
+                              cachedResult.success ? cachedResult.solutionIndex : -1,
+                              0U,
+                              0U,
+                              0ULL);
+            return cachedResult.success;
+        }
+        const auto lookupStart = Clock::now();
+        const auto lookupOutcome = lookupOverrideSolutions(
+            m_override, baseKey, getOverrideArchName(handle), resolvedCuCount);
+        const auto lookupEnd = Clock::now();
+        OverrideTelemetry::instance().recordLookupTier(baseKey, lookupOutcome.tier);
+
+        for(auto candidateIdx : lookupOutcome.candidates)
+        {
+            solutionIndex[0] = candidateIdx;
+            overrideResults.clear();
+            bool candidateAccepted = false;
             if(rocblaslt_status_success
                == getSolutionsFromIndex(
                    handle, solutionIndex, overrideResults, max_workspace_bytes))
@@ -280,14 +1919,32 @@ bool problem_override_from_file_cpp(
 
                 if(success)
                 {
+                    candidateAccepted = true;
                     overrideResults[0].workspaceSize = required_workspace_size;
                     heuristicResultsArray.push_back(overrideResults[0]);
+                    CachedOverrideResult cachedSuccess;
+                    cachedSuccess.initialized   = true;
+                    cachedSuccess.success       = true;
+                    cachedSuccess.solutionIndex = solutionIndex[0];
+                    cachedSuccess.tier          = lookupOutcome.tier;
+                    cachedSuccess.result        = overrideResults[0];
+                    OverrideHeuristicCache::instance().store(cacheKey, cachedSuccess);
                 }
             }
+
+            OverrideTelemetry::instance().recordCandidateAttempt(
+                baseKey, solutionIndex[0], candidateAccepted);
+            if(candidateAccepted)
+                break;
         }
 
         if(!success)
         {
+            CachedOverrideResult cachedFailure;
+            cachedFailure.initialized = true;
+            cachedFailure.success     = false;
+            cachedFailure.tier        = lookupOutcome.tier;
+            OverrideHeuristicCache::instance().store(cacheKey, cachedFailure);
             log_info(__func__, "No valid solution index found in override file.");
         }
         else
@@ -296,6 +1953,36 @@ bool problem_override_from_file_cpp(
             mapping_result += std::to_string(solutionIndex[0]);
             log_info(__func__, mapping_result);
         }
+        dumpOverrideTrace(OverrideApiPath::cpp_api,
+                          success ? "selected" : "no_valid_solution",
+                          baseKey,
+                          lookupOutcome.tier,
+                          resolvedCuCount,
+                          lookupOutcome.resolvedCuCount > 0 ? lookupOutcome.resolvedCuCount
+                                                            : resolvedCuCount,
+                          0U,
+                          false,
+                          success,
+                          success ? solutionIndex[0] : -1,
+                          0U,
+                          0U,
+                          0ULL);
+        OverrideTelemetry::instance().recordFinalResult(
+            baseKey, lookupOutcome.tier, success, success ? solutionIndex[0] : -1);
+        OverrideTelemetry::instance().recordDurations(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - callStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(preloadEnd - preloadStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(cacheProbeEnd
+                                                                     - cacheProbeStart)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(lookupEnd - lookupStart)
+                    .count()));
     }
 
     return success;
@@ -1606,6 +3293,24 @@ rocblaslt_status
                     "data",
                     pref->max_workspace_bytes);
             break;
+        case ROCBLASLT_MATMUL_PREF_OVERLAP_MODE_EXT:
+            pref->overlap_mode = *(uint32_t*)data;
+            break;
+        case ROCBLASLT_MATMUL_PREF_EFFECTIVE_CU_COUNT_EXT:
+            pref->effective_cu_count = *(uint32_t*)data;
+            break;
+        case ROCBLASLT_MATMUL_PREF_EFFECTIVE_CU_BUCKET_EXT:
+            pref->effective_cu_bucket = *(uint32_t*)data;
+            break;
+        case ROCBLASLT_MATMUL_PREF_COMM_PRESSURE_LEVEL_EXT:
+            pref->comm_pressure_level = *(uint32_t*)data;
+            break;
+        case ROCBLASLT_MATMUL_PREF_TOPOLOGY_SCOPE_EXT:
+            pref->topology_scope = *(uint32_t*)data;
+            break;
+        case ROCBLASLT_MATMUL_PREF_POLICY_HINT_VERSION_EXT:
+            pref->policy_hint_version = *(uint32_t*)data;
+            break;
         default:
             log_error(__func__, "invalid attribute", attribute);
             return rocblaslt_status_invalid_value;
@@ -1669,6 +3374,30 @@ rocblaslt_status
                     sizeInBytes,
                     "data[out]",
                     pref->max_workspace_bytes);
+            break;
+        case ROCBLASLT_MATMUL_PREF_OVERLAP_MODE_EXT:
+            *sizeWritten     = sizeof(uint32_t);
+            *(uint32_t*)data = pref->overlap_mode;
+            break;
+        case ROCBLASLT_MATMUL_PREF_EFFECTIVE_CU_COUNT_EXT:
+            *sizeWritten     = sizeof(uint32_t);
+            *(uint32_t*)data = pref->effective_cu_count;
+            break;
+        case ROCBLASLT_MATMUL_PREF_EFFECTIVE_CU_BUCKET_EXT:
+            *sizeWritten     = sizeof(uint32_t);
+            *(uint32_t*)data = pref->effective_cu_bucket;
+            break;
+        case ROCBLASLT_MATMUL_PREF_COMM_PRESSURE_LEVEL_EXT:
+            *sizeWritten     = sizeof(uint32_t);
+            *(uint32_t*)data = pref->comm_pressure_level;
+            break;
+        case ROCBLASLT_MATMUL_PREF_TOPOLOGY_SCOPE_EXT:
+            *sizeWritten     = sizeof(uint32_t);
+            *(uint32_t*)data = pref->topology_scope;
+            break;
+        case ROCBLASLT_MATMUL_PREF_POLICY_HINT_VERSION_EXT:
+            *sizeWritten     = sizeof(uint32_t);
+            *(uint32_t*)data = pref->policy_hint_version;
             break;
         default:
             return rocblaslt_status_invalid_value;
@@ -1785,10 +3514,27 @@ rocblaslt_status
         }
         auto prob = construct_rocblaslt_problem(
             handle, matmul_desc, matA, matB, matC, matD, &alpha, &beta, pref->max_workspace_bytes);
+        applyUopcPreferenceToProblem(pref, prob);
+        applyRuntimeUopcHint(handle, prob);
 
-        OverrideSingleton& override         = OverrideSingleton::getInstance();
-        bool               override_success = false;
-        if(override.env_mode)
+        ScopedOverrideSingleton& scopedExact      = ScopedOverrideSingleton::getInstance();
+        OverrideSingleton&       override         = OverrideSingleton::getInstance();
+        bool                     scoped_success   = false;
+        bool                     override_success = false;
+        if(scopedExact.env_mode && shouldUseScopedUopcExact(prob))
+        {
+            scoped_success = problem_scoped_override_from_file(handle,
+                                                               prob,
+                                                               matmul_desc,
+                                                               heuristicResultsArray,
+                                                               scopedExact.file_path,
+                                                               pref->max_workspace_bytes);
+            if(scoped_success)
+                requestedAlgoCount--;
+
+            log_api(__func__, "ScopedOverrideAlgoCount", scoped_success ? 1 : 0);
+        }
+        else if(override.env_mode)
         {
             override_success = problem_override_from_file(handle,
                                                           prob,
@@ -1808,13 +3554,14 @@ rocblaslt_status
                                       handle,
                                       tensile_data,
                                       requestedAlgoCount,
-                                      override_success ? &heuristicResultsArray[1]
-                                                       : heuristicResultsArray,
+                                      (scoped_success || override_success)
+                                          ? &heuristicResultsArray[1]
+                                          : heuristicResultsArray,
                                       returnAlgoCount,
                                       pref->max_workspace_bytes);
         }
 
-        if(override_success)
+        if(scoped_success || override_success)
         {
 
             int oriReturnAlgoCount = *returnAlgoCount;
@@ -2037,11 +3784,20 @@ rocblaslt_status
     rocblaslt_status status = rocblaslt_status_success;
     try
     {
+        ScopedOverrideSingleton&                       scopedExact = ScopedOverrideSingleton::getInstance();
         OverrideSingleton&                             override = OverrideSingleton::getInstance();
+        bool                                           scoped_success = false;
         bool                                           override_success = false;
         std::vector<rocblaslt_matmul_heuristic_result> override_result;
 
-        if(override.env_mode)
+        if(scopedExact.env_mode && TensileDataGemmEffectiveCuCount(gemmData) > 0)
+        {
+            scoped_success = problem_scoped_override_from_file_cpp(
+                handle, gemmType, gemmData, override_result, scopedExact.file_path, maxWorkspaceBytes);
+
+            log_api(__func__, "ScopedOverrideAlgoCount", scoped_success ? 1 : 0);
+        }
+        else if(override.env_mode)
         {
             override_success = problem_override_from_file_cpp(
                 handle, gemmType, gemmData, override_result, override.file_path, maxWorkspaceBytes);
@@ -2055,10 +3811,11 @@ rocblaslt_status
                                    gemmType,
                                    gemmData,
                                    maxWorkspaceBytes,
-                                   override_success ? requestedAlgoCount - 1 : requestedAlgoCount,
+                                   (scoped_success || override_success) ? requestedAlgoCount - 1
+                                                                       : requestedAlgoCount,
                                    results);
 
-        if(override_success)
+        if(scoped_success || override_success)
         {
 
             results.insert(results.begin(), override_result[0]);
